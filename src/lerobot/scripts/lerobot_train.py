@@ -39,6 +39,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.dpo import DPOConfig, compute_dpo_fm_loss
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
@@ -66,6 +67,9 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
+    dpo_config: DPOConfig | None = None,
+    ref_policy: PreTrainedPolicy | None = None,
+    batch_rejected: Any | None = None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -83,6 +87,9 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         rabc_weights_provider: Optional RABCWeights instance for sample weighting.
+        dpo_config: Optional DPOConfig for DPO-FM training.
+        ref_policy: Optional frozen reference policy for DPO-FM.
+        batch_rejected: Optional rejected batch for DPO-FM.
 
     Returns:
         A tuple containing:
@@ -100,8 +107,15 @@ def update_policy(
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        # Use per-sample loss when RA-BC is enabled for proper weighting
-        if rabc_batch_weights is not None:
+        if dpo_config is not None and ref_policy is not None and batch_rejected is not None:
+            # DPO-FM: preferred/rejected ペアから DPO loss を計算
+            # DDP ラップを外して内部メソッドにアクセスできるようにする
+            unwrapped_policy = accelerator.unwrap_model(policy)
+            loss, output_dict = compute_dpo_fm_loss(
+                unwrapped_policy, ref_policy, batch, batch_rejected, dpo_config
+            )
+        elif rabc_batch_weights is not None:
+            # Use per-sample loss when RA-BC is enabled for proper weighting
             # Get per-sample losses
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
@@ -317,6 +331,29 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             device=device,
         )
 
+    # DPO-FM: reference model のロード
+    ref_policy = None
+    dpo_config = None
+    if cfg.use_dpo:
+        if cfg.dpo_reference_path is None:
+            raise ValueError("use_dpo=True の場合 dpo_reference_path が必要です")
+
+        dpo_config = DPOConfig(beta=cfg.dpo_beta, reference_path=cfg.dpo_reference_path)
+        logging.info(f"DPO-FM enabled: beta={dpo_config.beta}, ref={cfg.dpo_reference_path}")
+
+        # SFT チェックポイントから reference model をロード（凍結）
+        ref_policy = make_policy(
+            cfg=cfg.policy,
+            ds_meta=dataset.meta,
+            rename_map=cfg.rename_map,
+        )
+        ref_policy = ref_policy.__class__.from_pretrained(cfg.dpo_reference_path)
+        ref_policy.eval()
+        for param in ref_policy.parameters():
+            param.requires_grad = False
+        ref_policy = ref_policy.to(device)
+        logging.info("Reference model loaded and frozen for DPO-FM")
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -367,12 +404,74 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    # DPO-FM: rejected 用の DataLoader を作成
+    # データセットの episodes.jsonl に is_preferred フィールドがある前提
+    # is_preferred=True → preferred (winner), is_preferred=False → rejected (loser)
+    dl_iter_rej = None
+    if cfg.use_dpo:
+        import pyarrow.parquet as pq
+
+        episodes_path = dataset.root / "meta" / "episodes.parquet"
+        if episodes_path.exists():
+            episodes_table = pq.read_table(episodes_path)
+            if "is_preferred" in episodes_table.column_names:
+                is_preferred = episodes_table.column("is_preferred").to_pylist()
+                rejected_indices = [i for i, pref in enumerate(is_preferred) if not pref]
+                preferred_indices = [i for i, pref in enumerate(is_preferred) if pref]
+            else:
+                # is_preferred フィールドがない場合: 偶数=preferred, 奇数=rejected（テスト用）
+                logging.warning(
+                    "is_preferred column not found in episodes.parquet. "
+                    "Using even=preferred, odd=rejected for testing."
+                )
+                all_episodes = list(range(dataset.num_episodes))
+                preferred_indices = [i for i in all_episodes if i % 2 == 0]
+                rejected_indices = [i for i in all_episodes if i % 2 != 0]
+        else:
+            # parquet がない場合も同様にフォールバック
+            logging.warning(
+                "episodes.parquet not found. Using even=preferred, odd=rejected for testing."
+            )
+            all_episodes = list(range(dataset.num_episodes))
+            preferred_indices = [i for i in all_episodes if i % 2 == 0]
+            rejected_indices = [i for i in all_episodes if i % 2 != 0]
+
+        logging.info(f"DPO: {len(preferred_indices)} preferred, {len(rejected_indices)} rejected episodes")
+
+        # preferred 用データセット（メインの dataset を差し替え）
+        dataset_pref = make_dataset(cfg, episodes=preferred_indices)
+        dataset_rej = make_dataset(cfg, episodes=rejected_indices)
+
+        dataloader_pref = torch.utils.data.DataLoader(
+            dataset_pref,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            pin_memory=device.type == "cuda",
+            drop_last=True,
+        )
+        dataloader_rej = torch.utils.data.DataLoader(
+            dataset_rej,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            pin_memory=device.type == "cuda",
+            drop_last=True,
+        )
+
+        # DPO 用の DataLoader で差し替え
+        dataloader = dataloader_pref
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
     dl_iter = cycle(dataloader)
+
+    if cfg.use_dpo:
+        dataloader_rej = accelerator.prepare(dataloader_rej)
+        dl_iter_rej = cycle(dataloader_rej)
 
     policy.train()
 
@@ -412,6 +511,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         start_time = time.perf_counter()
         batch = next(dl_iter)
         batch = preprocessor(batch)
+
+        # DPO-FM: rejected batch も取得して前処理
+        batch_rej = None
+        if cfg.use_dpo and dl_iter_rej is not None:
+            batch_rej = next(dl_iter_rej)
+            batch_rej = preprocessor(batch_rej)
+
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -423,6 +529,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
+            dpo_config=dpo_config,
+            ref_policy=ref_policy,
+            batch_rejected=batch_rej,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we

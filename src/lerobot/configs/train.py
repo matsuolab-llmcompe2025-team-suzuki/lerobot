@@ -77,6 +77,11 @@ class TrainPipelineConfig(HubMixin):
     rabc_epsilon: float = 1e-6  # Small constant for numerical stability
     rabc_head_mode: str | None = "sparse"  # For dual-head models: "sparse" or "dense"
 
+    # DPO-FM (Direct Preference Optimization for Flow Matching) parameters
+    use_dpo: bool = False  # DPO-FM 学習を有効にする
+    dpo_beta: float = 1000.0  # DPO の温度パラメータ（flow matching 向けの大きな値）
+    dpo_reference_path: str | None = None  # SFT チェックポイントのパス（reference model 用）
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
