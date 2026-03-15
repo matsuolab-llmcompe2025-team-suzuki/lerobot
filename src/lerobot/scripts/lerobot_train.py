@@ -338,8 +338,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if cfg.dpo_reference_path is None:
             raise ValueError("use_dpo=True の場合 dpo_reference_path が必要です")
 
-        dpo_config = DPOConfig(beta=cfg.dpo_beta, reference_path=cfg.dpo_reference_path)
-        logging.info(f"DPO-FM enabled: beta={dpo_config.beta}, ref={cfg.dpo_reference_path}")
+        dpo_config = DPOConfig(
+            beta=cfg.dpo_beta,
+            reference_path=cfg.dpo_reference_path,
+            alpha=cfg.dpo_alpha,
+            dim_weights=cfg.dpo_dim_weights,
+        )
+        logging.info(
+            f"DPO-FM enabled: beta={dpo_config.beta}, alpha={dpo_config.alpha}, "
+            f"dim_weights={dpo_config.dim_weights}, ref={cfg.dpo_reference_path}"
+        )
 
         # SFT チェックポイントから reference model をロード（凍結）
         ref_policy = make_policy(

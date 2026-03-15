@@ -81,6 +81,8 @@ class TrainPipelineConfig(HubMixin):
     use_dpo: bool = False  # DPO-FM 学習を有効にする
     dpo_beta: float = 1000.0  # DPO の温度パラメータ（flow matching 向けの大きな値）
     dpo_reference_path: str | None = None  # SFT チェックポイントのパス（reference model 用）
+    dpo_alpha: float = 1.0  # DPO/SFT 配分: 1.0=純粋DPO, 0.5=Hybrid, 0.0=純粋SFT
+    dpo_dim_weights: list[float] | None = None  # action 次元別重み（例: グリッパ重視 [1,1,1,1,1,5,1,1,1,1,1]）
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
