@@ -258,3 +258,46 @@ class ImageTransforms(Transform):
 
     def forward(self, *inputs: Any) -> Any:
         return self.tf(*inputs)
+
+
+class ResizeWithPadTransform:
+    """DataLoader worker 用の resize + pad transform。
+    アスペクト比を保持しつつ target_height x target_width に resize + zero-pad する。
+    modeling_pi05.resize_with_pad_torch と同一ロジック（CPU 版）。
+
+    入力: (C, H, W) float32 [0, 1]
+    出力: (C, target_height, target_width) float32 [0, 1]
+    """
+
+    def __init__(self, target_height: int, target_width: int, mode: str = "bilinear"):
+        self.target_height = target_height
+        self.target_width = target_width
+        self.mode = mode
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        # img: (C, H, W) float32 [0, 1]
+        if img.shape[1:] == (self.target_height, self.target_width):
+            return img
+
+        c, h, w = img.shape
+        ratio = max(w / self.target_width, h / self.target_height)
+        resized_h = int(h / ratio)
+        resized_w = int(w / ratio)
+
+        # F.interpolate は (N, C, H, W) を要求するので unsqueeze/squeeze
+        resized = torch.nn.functional.interpolate(
+            img.unsqueeze(0),
+            size=(resized_h, resized_w),
+            mode=self.mode,
+            align_corners=False,
+        ).squeeze(0).clamp(0.0, 1.0)
+
+        # zero-pad で target size に合わせる
+        pad_h0, rem_h = divmod(self.target_height - resized_h, 2)
+        pad_h1 = pad_h0 + rem_h
+        pad_w0, rem_w = divmod(self.target_width - resized_w, 2)
+        pad_w1 = pad_w0 + rem_w
+
+        return torch.nn.functional.pad(
+            resized, (pad_w0, pad_w1, pad_h0, pad_h1), mode="constant", value=0.0
+        )

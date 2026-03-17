@@ -241,6 +241,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # DataLoader worker で画像を事前リサイズし、forward 内の GPU リサイズをスキップする
+    if hasattr(cfg.policy, "image_resolution") and cfg.policy.image_resolution:
+        from lerobot.datasets.transforms import ResizeWithPadTransform
+
+        target_h, target_w = cfg.policy.image_resolution
+        resize_tf = ResizeWithPadTransform(target_h, target_w)
+        if dataset.image_transforms is not None:
+            from torchvision.transforms.v2 import Compose
+
+            dataset.image_transforms = Compose([dataset.image_transforms, resize_tf])
+        else:
+            dataset.image_transforms = resize_tf
+        logging.info(f"Added DataLoader resize transform: {target_h}x{target_w}")
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -410,6 +424,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
+        persistent_workers=cfg.num_workers > 0,
     )
 
     # DPO-FM: rejected 用の DataLoader を作成
@@ -450,6 +465,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         dataset_pref = make_dataset(cfg, episodes=preferred_indices)
         dataset_rej = make_dataset(cfg, episodes=rejected_indices)
 
+        # DPO データセットにも DataLoader resize transform を適用
+        if hasattr(cfg.policy, "image_resolution") and cfg.policy.image_resolution:
+            from lerobot.datasets.transforms import ResizeWithPadTransform
+
+            target_h, target_w = cfg.policy.image_resolution
+            resize_tf = ResizeWithPadTransform(target_h, target_w)
+            for ds in (dataset_pref, dataset_rej):
+                if ds.image_transforms is not None:
+                    from torchvision.transforms.v2 import Compose
+
+                    ds.image_transforms = Compose([ds.image_transforms, resize_tf])
+                else:
+                    ds.image_transforms = resize_tf
+
         dataloader_pref = torch.utils.data.DataLoader(
             dataset_pref,
             num_workers=cfg.num_workers,
@@ -457,6 +486,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             shuffle=True,
             pin_memory=device.type == "cuda",
             drop_last=True,
+            persistent_workers=cfg.num_workers > 0,
         )
         dataloader_rej = torch.utils.data.DataLoader(
             dataset_rej,
@@ -465,6 +495,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             shuffle=True,
             pin_memory=device.type == "cuda",
             drop_last=True,
+            persistent_workers=cfg.num_workers > 0,
         )
 
         # DPO 用の DataLoader で差し替え
@@ -554,6 +585,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            # loss_per_dim を log step でのみ CPU 転送（GPU sync stall を回避）
+            if output_dict and "loss_per_dim" in output_dict:
+                lpd = output_dict["loss_per_dim"]
+                if isinstance(lpd, torch.Tensor):
+                    output_dict["loss_per_dim"] = lpd.cpu().numpy().tolist()
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:

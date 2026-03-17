@@ -98,9 +98,10 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
-    # Beta sampling uses _sample_dirichlet which isn't implemented for MPS, so sample on CPU
-    alpha_t = torch.tensor(alpha, dtype=torch.float32)
-    beta_t = torch.tensor(beta, dtype=torch.float32)
+    # MPS では _sample_dirichlet が未実装のため CPU フォールバック、CUDA は GPU 直接サンプリング
+    sample_device = device if (isinstance(device, torch.device) and device.type == "cuda") or device == "cuda" else "cpu"
+    alpha_t = torch.tensor(alpha, dtype=torch.float32, device=sample_device)
+    beta_t = torch.tensor(beta, dtype=torch.float32, device=sample_device)
     dist = torch.distributions.Beta(alpha_t, beta_t)
     return dist.sample((bsize,)).to(device)
 
@@ -1198,7 +1199,7 @@ class PI05Policy(PreTrainedPolicy):
 
         # Create image features not present in the batch as fully 0 padded images
         for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
+            img = torch.full_like(img, -1.0)  # Padded with -1 for SigLIP
             mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
@@ -1267,8 +1268,9 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        # GPU tensor のまま保持し、log step でのみ CPU 転送する（毎 step の GPU sync stall を回避）
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": losses.mean(dim=[0, 1]).detach(),
         }
 
         if reduction == "none":

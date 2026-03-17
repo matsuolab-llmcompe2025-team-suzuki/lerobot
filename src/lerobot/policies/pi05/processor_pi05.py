@@ -14,8 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -53,6 +52,11 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
+    # np.linspace は固定値なので 1 回だけ計算してキャッシュ
+    _bins: np.ndarray = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        self._bins = np.linspace(-1, 1, 256 + 1)[:-1]
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -64,13 +68,13 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         if tasks is None:
             raise ValueError("No task found in complementary data")
 
-        # TODO: check if this necessary
-        state = deepcopy(state)
+        # deepcopy は不要: 元 tensor を変更しないので clone で十分
+        state = state.clone()
 
         # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         state_np = state.cpu().numpy()
-        discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        discretized_states = np.digitize(state_np, bins=self._bins) - 1
 
         full_prompts = []
         for i, task in enumerate(tasks):
