@@ -339,6 +339,10 @@ def write_tasks(tasks: pandas.DataFrame, local_dir: Path) -> None:
 
 def load_tasks(local_dir: Path) -> pandas.DataFrame:
     tasks = pd.read_parquet(local_dir / DEFAULT_TASKS_PATH)
+    # v3.0形式では 'task' がカラムに格納されている（インデックスではない）ため変換
+    # __getitem__ で tasks.iloc[task_idx].name がタスクテキストを返すように設定
+    if "task" in tasks.columns:
+        tasks = tasks.sort_values("task_index").set_index("task")
     tasks.index.name = "task"
     return tasks
 

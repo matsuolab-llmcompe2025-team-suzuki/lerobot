@@ -440,8 +440,10 @@ class PaliGemmaWithExpertModel(
         out_dtype = image.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
+        # transformers バージョンにより戻り値が異なる（5.x: BaseModelOutputWithPooling, 4.53+: Tensor）
         image_outputs = self.paligemma.model.get_image_features(image)
-        features = image_outputs.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
+        image_features = image_outputs.pooler_output if hasattr(image_outputs, "pooler_output") else image_outputs
+        features = image_features * self.paligemma.config.text_config.hidden_size**0.5
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
@@ -586,9 +588,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
+            # backend='aot_eager': inductor バグ (KeyError: _scaled_dot_product_efficient_attention) を回避
+            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode, backend="aot_eager")
             # Also compile the main forward pass used during training
-            self.forward = torch.compile(self.forward, mode=config.compile_mode)
+            self.forward = torch.compile(self.forward, mode=config.compile_mode, backend="aot_eager")
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
