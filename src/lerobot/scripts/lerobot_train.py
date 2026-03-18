@@ -428,32 +428,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
 
     # DPO-FM: rejected 用の DataLoader を作成
-    # データセットの episodes.jsonl に is_preferred フィールドがある前提
+    # episodes metadata の is_preferred フィールドで preferred/rejected を分離
     # is_preferred=True → preferred (winner), is_preferred=False → rejected (loser)
     dl_iter_rej = None
     if cfg.use_dpo:
-        import pyarrow.parquet as pq
-
-        episodes_path = dataset.root / "meta" / "episodes.parquet"
-        if episodes_path.exists():
-            episodes_table = pq.read_table(episodes_path)
-            if "is_preferred" in episodes_table.column_names:
-                is_preferred = episodes_table.column("is_preferred").to_pylist()
-                rejected_indices = [i for i, pref in enumerate(is_preferred) if not pref]
-                preferred_indices = [i for i, pref in enumerate(is_preferred) if pref]
-            else:
-                # is_preferred フィールドがない場合: 偶数=preferred, 奇数=rejected（テスト用）
-                logging.warning(
-                    "is_preferred column not found in episodes.parquet. "
-                    "Using even=preferred, odd=rejected for testing."
-                )
-                all_episodes = list(range(dataset.num_episodes))
-                preferred_indices = [i for i in all_episodes if i % 2 == 0]
-                rejected_indices = [i for i in all_episodes if i % 2 != 0]
+        # dataset.meta.episodes は load_episodes() で v3.0 チャンク形式から読み込み済み
+        episodes_meta = dataset.meta.episodes
+        if "is_preferred" in episodes_meta.column_names:
+            is_preferred = episodes_meta["is_preferred"]
+            preferred_indices = [i for i, pref in enumerate(is_preferred) if pref]
+            rejected_indices = [i for i, pref in enumerate(is_preferred) if not pref]
         else:
-            # parquet がない場合も同様にフォールバック
+            # is_preferred フィールドがない場合: 偶数=preferred, 奇数=rejected（テスト用）
             logging.warning(
-                "episodes.parquet not found. Using even=preferred, odd=rejected for testing."
+                "is_preferred column not found in episodes metadata. "
+                "Using even=preferred, odd=rejected for testing."
             )
             all_episodes = list(range(dataset.num_episodes))
             preferred_indices = [i for i in all_episodes if i % 2 == 0]
