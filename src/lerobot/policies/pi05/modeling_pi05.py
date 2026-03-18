@@ -786,7 +786,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, return_aux=False):
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -838,8 +838,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        if return_aux:
+            return losses, {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded}
+
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1314,6 +1318,34 @@ class PI05Policy(PreTrainedPolicy):
             )
         return torch.tensor(self.config.action_dim_weights, device=device, dtype=dtype)
 
+    def _compute_smoothness_loss(
+        self,
+        x_t: Tensor,
+        v_t: Tensor,
+        time_expanded: Tensor,
+        action_dim: int,
+    ) -> tuple[Tensor, Tensor | None]:
+        """隣接タイムステップ間のアクション差分を正則化する smoothness loss を計算する。"""
+        reconstructed_actions = x_t[:, :, :action_dim] - time_expanded * v_t[:, :, :action_dim]
+        action_diffs = reconstructed_actions[:, 1:, :] - reconstructed_actions[:, :-1, :]
+        action_diffs_sq = action_diffs.pow(2)
+
+        exclude_dims = self.config.smoothness_exclude_dims or []
+        if exclude_dims:
+            include_mask = torch.ones(action_dim, device=action_diffs_sq.device, dtype=action_diffs_sq.dtype)
+            include_mask[exclude_dims] = 0.0
+            included_dims = int(include_mask.sum().item())
+            if included_dims <= 0:
+                raise ValueError("smoothness_exclude_dims excludes all action dimensions")
+            action_diffs_sq = action_diffs_sq * include_mask.view(1, 1, -1)
+            smoothness_per_sample = action_diffs_sq.sum(dim=(1, 2)) / (action_diffs_sq.shape[1] * included_dims)
+            smoothness_per_dim = action_diffs_sq.mean(dim=[0, 1])
+        else:
+            smoothness_per_sample = action_diffs_sq.mean(dim=(1, 2))
+            smoothness_per_dim = action_diffs_sq.mean(dim=[0, 1])
+
+        return smoothness_per_sample, smoothness_per_dim
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1328,9 +1360,18 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        needs_smoothness = self.config.smoothness_lambda > 0
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        model_forward_output = self.model.forward(
+            images, img_masks, tokens, masks, actions,
+            return_aux=needs_smoothness,
+        )
+        if needs_smoothness:
+            losses, aux = model_forward_output
+        else:
+            losses = model_forward_output
+            aux = None
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1348,14 +1389,37 @@ class PI05Policy(PreTrainedPolicy):
             losses = raw_losses * weights.view(1, 1, -1)
             loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
 
+        flow_per_sample_loss = losses.mean(dim=(1, 2))
+        flow_loss = flow_per_sample_loss.mean()
+        loss_dict["flow_loss"] = flow_loss.item()
+
+        # Smoothness regularization (Run 11)
+        smoothness_per_sample_loss = None
+        if needs_smoothness:
+            smoothness_per_sample_loss, smoothness_per_dim = self._compute_smoothness_loss(
+                aux["x_t"],
+                aux["v_t"],
+                aux["time_expanded"],
+                original_action_dim,
+            )
+            smoothness_loss = smoothness_per_sample_loss.mean()
+            loss_dict["smoothness_loss"] = smoothness_loss.item()
+            loss_dict["smoothness_per_dim"] = smoothness_per_dim.detach()
+        else:
+            smoothness_loss = None
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = flow_per_sample_loss
+            if smoothness_per_sample_loss is not None:
+                per_sample_loss = per_sample_loss + self.config.smoothness_lambda * smoothness_per_sample_loss
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = flow_loss
+            if smoothness_loss is not None:
+                loss = loss + self.config.smoothness_lambda * smoothness_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

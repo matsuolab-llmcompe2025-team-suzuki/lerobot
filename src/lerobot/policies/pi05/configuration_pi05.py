@@ -88,8 +88,10 @@ class PI05Config(PreTrainedConfig):
     correlated_noise_stats_path: str | None = None
     correlated_noise_beta: float = 0.5
 
-    # Run 10: Action-dimension weighted loss
+    # Run 10/11: Action-dimension weighted loss + Smoothness regularization
     action_dim_weights: list[float] | None = None
+    smoothness_lambda: float = 0.0
+    smoothness_exclude_dims: list[int] | None = None
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -142,6 +144,16 @@ class PI05Config(PreTrainedConfig):
                 raise ValueError(
                     f"action_dim_weights length ({len(self.action_dim_weights)}) exceeds max_action_dim ({self.max_action_dim})"
                 )
+
+        if self.smoothness_lambda < 0:
+            raise ValueError("smoothness_lambda must be >= 0")
+
+        if self.smoothness_exclude_dims is not None:
+            for dim in self.smoothness_exclude_dims:
+                if dim < 0 or dim >= self.max_action_dim:
+                    raise ValueError(
+                        f"smoothness_exclude_dims contains invalid dim {dim}; expected in [0, {self.max_action_dim})"
+                    )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
