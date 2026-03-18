@@ -88,6 +88,9 @@ class PI05Config(PreTrainedConfig):
     correlated_noise_stats_path: str | None = None
     correlated_noise_beta: float = 0.5
 
+    # Run 10: Action-dimension weighted loss
+    action_dim_weights: list[float] | None = None
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -131,6 +134,14 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 "correlated_noise_stats_path must be provided when use_correlated_noise=True"
             )
+
+        if self.action_dim_weights is not None:
+            if len(self.action_dim_weights) == 0:
+                raise ValueError("action_dim_weights must be non-empty when provided")
+            if len(self.action_dim_weights) > self.max_action_dim:
+                raise ValueError(
+                    f"action_dim_weights length ({len(self.action_dim_weights)}) exceeds max_action_dim ({self.max_action_dim})"
+                )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

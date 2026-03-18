@@ -1304,6 +1304,16 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
+    def _get_action_dim_weights(self, action_dim: int, device: torch.device, dtype: torch.dtype) -> Tensor | None:
+        """action_dim_weights config からウェイトテンソルを取得する。"""
+        if self.config.action_dim_weights is None:
+            return None
+        if len(self.config.action_dim_weights) != action_dim:
+            raise ValueError(
+                f"Expected action_dim_weights to have length {action_dim}, got {len(self.config.action_dim_weights)}"
+            )
+        return torch.tensor(self.config.action_dim_weights, device=device, dtype=dtype)
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1326,10 +1336,17 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        raw_losses = losses
         # GPU tensor のまま保持し、log step でのみ CPU 転送する（毎 step の GPU sync stall を回避）
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach(),
+            "loss_per_dim": raw_losses.mean(dim=[0, 1]).detach(),
         }
+
+        # Action-dimension weighted loss (Run 10)
+        weights = self._get_action_dim_weights(original_action_dim, raw_losses.device, raw_losses.dtype)
+        if weights is not None:
+            losses = raw_losses * weights.view(1, 1, -1)
+            loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
