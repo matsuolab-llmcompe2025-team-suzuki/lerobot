@@ -240,6 +240,19 @@ def make_pre_post_processors(
         NotImplementedError: If a processor factory is not implemented for the given
             policy configuration type.
     """
+    # Per-timestamp stats: factory 経由のロードでも stats を差し替える
+    if isinstance(policy_cfg, PI05Config) and kwargs.get("dataset_stats") is not None:
+        from lerobot.policies.pi05.processor_pi05 import _load_per_timestamp_action_stats
+
+        updated_stats = _load_per_timestamp_action_stats(policy_cfg, kwargs.get("dataset_stats"))
+        kwargs["dataset_stats"] = updated_stats
+
+        if kwargs.get("preprocessor_overrides") and "normalizer_processor" in kwargs["preprocessor_overrides"]:
+            kwargs["preprocessor_overrides"]["normalizer_processor"]["stats"] = updated_stats
+
+        if kwargs.get("postprocessor_overrides") and "unnormalizer_processor" in kwargs["postprocessor_overrides"]:
+            kwargs["postprocessor_overrides"]["unnormalizer_processor"]["stats"] = updated_stats
+
     if pretrained_path:
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):

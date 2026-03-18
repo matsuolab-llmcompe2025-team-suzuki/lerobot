@@ -22,6 +22,7 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
@@ -585,6 +586,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # Correlated noise 用 Cholesky 分解キャッシュ
+        self._correlated_noise_cache: dict[tuple[str, torch.dtype], tuple[Tensor, int, int]] = {}
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -625,14 +629,65 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
+    def _get_correlated_noise_cache(self, device: torch.device) -> tuple[Tensor, int, int]:
+        """Correlated noise 用の Cholesky 分解行列をキャッシュ付きでロードする。"""
+        if self.config.correlated_noise_stats_path is None:
+            raise ValueError("correlated_noise_stats_path is required when use_correlated_noise=True")
+
+        cache_key = (str(device), torch.float32)
+        if cache_key in self._correlated_noise_cache:
+            return self._correlated_noise_cache[cache_key]
+
+        stats_path = Path(self.config.correlated_noise_stats_path)
+        if not stats_path.exists():
+            raise FileNotFoundError(f"Correlated-noise stats file not found: {stats_path}")
+
+        npz = np.load(stats_path)
+        if "chol" not in npz:
+            raise ValueError(f"Expected `chol` array in correlated-noise stats: {stats_path}")
+
+        chol = torch.as_tensor(npz["chol"], dtype=torch.float32, device=device)
+        chunk_size = int(npz.get("chunk_size", self.config.chunk_size))
+        action_dim = int(npz.get("action_dim", chol.shape[0] // chunk_size))
+        self._correlated_noise_cache[cache_key] = (chol, chunk_size, action_dim)
+        return self._correlated_noise_cache[cache_key]
+
     def sample_noise(self, shape, device):
-        return torch.normal(
+        if not self.config.use_correlated_noise:
+            return torch.normal(
+                mean=0.0,
+                std=1.0,
+                size=shape,
+                dtype=torch.float32,
+                device=device,
+            )
+
+        if len(shape) != 3:
+            raise ValueError(f"Expected 3D noise shape (B, H, D), got {shape}")
+
+        batch_size, horizon, model_action_dim = shape
+        chol, stats_horizon, action_dim = self._get_correlated_noise_cache(device)
+        if horizon != stats_horizon:
+            raise ValueError(
+                f"Correlated-noise horizon mismatch: shape horizon={horizon}, stats horizon={stats_horizon}"
+            )
+        if action_dim > model_action_dim:
+            raise ValueError(
+                f"Correlated-noise action_dim={action_dim} exceeds requested model dim={model_action_dim}"
+            )
+
+        noise = torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
             dtype=torch.float32,
             device=device,
         )
+
+        z = torch.randn(batch_size, horizon * action_dim, dtype=torch.float32, device=device)
+        corr = z @ chol.transpose(0, 1)
+        noise[:, :, :action_dim] = corr.view(batch_size, horizon, action_dim)
+        return noise
 
     def sample_time(self, bsize, device):
         time_beta = sample_beta(

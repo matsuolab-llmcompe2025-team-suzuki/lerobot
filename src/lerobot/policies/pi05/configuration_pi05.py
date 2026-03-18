@@ -81,6 +81,13 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # Run 9: Per-timestamp normalization + Correlated noise
+    use_per_timestamp_action_stats: bool = False
+    per_timestamp_stats_path: str | None = None
+    use_correlated_noise: bool = False
+    correlated_noise_stats_path: str | None = None
+    correlated_noise_beta: float = 0.5
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -114,6 +121,16 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.use_per_timestamp_action_stats and not self.per_timestamp_stats_path:
+            raise ValueError(
+                "per_timestamp_stats_path must be provided when use_per_timestamp_action_stats=True"
+            )
+
+        if self.use_correlated_noise and not self.correlated_noise_stats_path:
+            raise ValueError(
+                "correlated_noise_stats_path must be provided when use_correlated_noise=True"
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
