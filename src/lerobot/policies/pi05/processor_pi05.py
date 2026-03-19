@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -37,6 +39,7 @@ from lerobot.processor import (
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
+    ACTION,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
@@ -97,6 +100,36 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         return features
 
 
+def _load_per_timestamp_action_stats(
+    config: PI05Config, dataset_stats: dict[str, dict[str, torch.Tensor]] | None
+) -> dict[str, dict[str, torch.Tensor]] | None:
+    """Optionally override ACTION mean/std with per-timestamp statistics from a sidecar npz file."""
+    if dataset_stats is None or not config.use_per_timestamp_action_stats:
+        return dataset_stats
+
+    if config.per_timestamp_stats_path is None:
+        raise ValueError("per_timestamp_stats_path is required when use_per_timestamp_action_stats=True")
+
+    stats_path = Path(config.per_timestamp_stats_path)
+    if not stats_path.exists():
+        raise FileNotFoundError(f"Per-timestamp stats file not found: {stats_path}")
+
+    npz = np.load(stats_path)
+    mean_hd = npz["mean_hd"]
+    std_hd = npz["std_hd"]
+
+    if mean_hd.shape != std_hd.shape:
+        raise ValueError(
+            f"Per-timestamp stats shape mismatch: mean={mean_hd.shape}, std={std_hd.shape}"
+        )
+
+    merged_stats = deepcopy(dataset_stats)
+    merged_stats.setdefault(ACTION, {})
+    merged_stats[ACTION]["mean"] = torch.as_tensor(mean_hd, dtype=torch.float32)
+    merged_stats[ACTION]["std"] = torch.as_tensor(std_hd, dtype=torch.float32)
+    return merged_stats
+
+
 def make_pi05_pre_post_processors(
     config: PI05Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -128,6 +161,8 @@ def make_pi05_pre_post_processors(
     Returns:
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
+
+    dataset_stats = _load_per_timestamp_action_stats(config, dataset_stats)
 
     # Add remaining processors
     input_steps: list[ProcessorStep] = [

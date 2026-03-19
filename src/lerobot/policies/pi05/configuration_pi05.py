@@ -81,6 +81,18 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # Run 9: Per-timestamp normalization + Correlated noise
+    use_per_timestamp_action_stats: bool = False
+    per_timestamp_stats_path: str | None = None
+    use_correlated_noise: bool = False
+    correlated_noise_stats_path: str | None = None
+    correlated_noise_beta: float = 0.5
+
+    # Run 10/11: Action-dimension weighted loss + Smoothness regularization
+    action_dim_weights: list[float] | None = None
+    smoothness_lambda: float = 0.0
+    smoothness_exclude_dims: list[int] | None = None
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -114,6 +126,34 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.use_per_timestamp_action_stats and not self.per_timestamp_stats_path:
+            raise ValueError(
+                "per_timestamp_stats_path must be provided when use_per_timestamp_action_stats=True"
+            )
+
+        if self.use_correlated_noise and not self.correlated_noise_stats_path:
+            raise ValueError(
+                "correlated_noise_stats_path must be provided when use_correlated_noise=True"
+            )
+
+        if self.action_dim_weights is not None:
+            if len(self.action_dim_weights) == 0:
+                raise ValueError("action_dim_weights must be non-empty when provided")
+            if len(self.action_dim_weights) > self.max_action_dim:
+                raise ValueError(
+                    f"action_dim_weights length ({len(self.action_dim_weights)}) exceeds max_action_dim ({self.max_action_dim})"
+                )
+
+        if self.smoothness_lambda < 0:
+            raise ValueError("smoothness_lambda must be >= 0")
+
+        if self.smoothness_exclude_dims is not None:
+            for dim in self.smoothness_exclude_dims:
+                if dim < 0 or dim >= self.max_action_dim:
+                    raise ValueError(
+                        f"smoothness_exclude_dims contains invalid dim {dim}; expected in [0, {self.max_action_dim})"
+                    )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

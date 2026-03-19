@@ -22,6 +22,7 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
@@ -585,6 +586,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # Correlated noise 用 Cholesky 分解キャッシュ
+        self._correlated_noise_cache: dict[tuple[str, torch.dtype], tuple[Tensor, int, int]] = {}
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -625,14 +629,65 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
+    def _get_correlated_noise_cache(self, device: torch.device) -> tuple[Tensor, int, int]:
+        """Correlated noise 用の Cholesky 分解行列をキャッシュ付きでロードする。"""
+        if self.config.correlated_noise_stats_path is None:
+            raise ValueError("correlated_noise_stats_path is required when use_correlated_noise=True")
+
+        cache_key = (str(device), torch.float32)
+        if cache_key in self._correlated_noise_cache:
+            return self._correlated_noise_cache[cache_key]
+
+        stats_path = Path(self.config.correlated_noise_stats_path)
+        if not stats_path.exists():
+            raise FileNotFoundError(f"Correlated-noise stats file not found: {stats_path}")
+
+        npz = np.load(stats_path)
+        if "chol" not in npz:
+            raise ValueError(f"Expected `chol` array in correlated-noise stats: {stats_path}")
+
+        chol = torch.as_tensor(npz["chol"], dtype=torch.float32, device=device)
+        chunk_size = int(npz.get("chunk_size", self.config.chunk_size))
+        action_dim = int(npz.get("action_dim", chol.shape[0] // chunk_size))
+        self._correlated_noise_cache[cache_key] = (chol, chunk_size, action_dim)
+        return self._correlated_noise_cache[cache_key]
+
     def sample_noise(self, shape, device):
-        return torch.normal(
+        if not self.config.use_correlated_noise:
+            return torch.normal(
+                mean=0.0,
+                std=1.0,
+                size=shape,
+                dtype=torch.float32,
+                device=device,
+            )
+
+        if len(shape) != 3:
+            raise ValueError(f"Expected 3D noise shape (B, H, D), got {shape}")
+
+        batch_size, horizon, model_action_dim = shape
+        chol, stats_horizon, action_dim = self._get_correlated_noise_cache(device)
+        if horizon != stats_horizon:
+            raise ValueError(
+                f"Correlated-noise horizon mismatch: shape horizon={horizon}, stats horizon={stats_horizon}"
+            )
+        if action_dim > model_action_dim:
+            raise ValueError(
+                f"Correlated-noise action_dim={action_dim} exceeds requested model dim={model_action_dim}"
+            )
+
+        noise = torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
             dtype=torch.float32,
             device=device,
         )
+
+        z = torch.randn(batch_size, horizon * action_dim, dtype=torch.float32, device=device)
+        corr = z @ chol.transpose(0, 1)
+        noise[:, :, :action_dim] = corr.view(batch_size, horizon, action_dim)
+        return noise
 
     def sample_time(self, bsize, device):
         time_beta = sample_beta(
@@ -731,7 +786,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, return_aux=False):
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -783,8 +838,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        if return_aux:
+            return losses, {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded}
+
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1249,6 +1308,44 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
+    def _get_action_dim_weights(self, action_dim: int, device: torch.device, dtype: torch.dtype) -> Tensor | None:
+        """action_dim_weights config からウェイトテンソルを取得する。"""
+        if self.config.action_dim_weights is None:
+            return None
+        if len(self.config.action_dim_weights) != action_dim:
+            raise ValueError(
+                f"Expected action_dim_weights to have length {action_dim}, got {len(self.config.action_dim_weights)}"
+            )
+        return torch.tensor(self.config.action_dim_weights, device=device, dtype=dtype)
+
+    def _compute_smoothness_loss(
+        self,
+        x_t: Tensor,
+        v_t: Tensor,
+        time_expanded: Tensor,
+        action_dim: int,
+    ) -> tuple[Tensor, Tensor | None]:
+        """隣接タイムステップ間のアクション差分を正則化する smoothness loss を計算する。"""
+        reconstructed_actions = x_t[:, :, :action_dim] - time_expanded * v_t[:, :, :action_dim]
+        action_diffs = reconstructed_actions[:, 1:, :] - reconstructed_actions[:, :-1, :]
+        action_diffs_sq = action_diffs.pow(2)
+
+        exclude_dims = self.config.smoothness_exclude_dims or []
+        if exclude_dims:
+            include_mask = torch.ones(action_dim, device=action_diffs_sq.device, dtype=action_diffs_sq.dtype)
+            include_mask[exclude_dims] = 0.0
+            included_dims = int(include_mask.sum().item())
+            if included_dims <= 0:
+                raise ValueError("smoothness_exclude_dims excludes all action dimensions")
+            action_diffs_sq = action_diffs_sq * include_mask.view(1, 1, -1)
+            smoothness_per_sample = action_diffs_sq.sum(dim=(1, 2)) / (action_diffs_sq.shape[1] * included_dims)
+            smoothness_per_dim = action_diffs_sq.mean(dim=[0, 1])
+        else:
+            smoothness_per_sample = action_diffs_sq.mean(dim=(1, 2))
+            smoothness_per_dim = action_diffs_sq.mean(dim=[0, 1])
+
+        return smoothness_per_sample, smoothness_per_dim
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1263,27 +1360,66 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        needs_smoothness = self.config.smoothness_lambda > 0
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        model_forward_output = self.model.forward(
+            images, img_masks, tokens, masks, actions,
+            return_aux=needs_smoothness,
+        )
+        if needs_smoothness:
+            losses, aux = model_forward_output
+        else:
+            losses = model_forward_output
+            aux = None
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        raw_losses = losses
         # GPU tensor のまま保持し、log step でのみ CPU 転送する（毎 step の GPU sync stall を回避）
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach(),
+            "loss_per_dim": raw_losses.mean(dim=[0, 1]).detach(),
         }
+
+        # Action-dimension weighted loss (Run 10)
+        weights = self._get_action_dim_weights(original_action_dim, raw_losses.device, raw_losses.dtype)
+        if weights is not None:
+            losses = raw_losses * weights.view(1, 1, -1)
+            loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
+
+        flow_per_sample_loss = losses.mean(dim=(1, 2))
+        flow_loss = flow_per_sample_loss.mean()
+        loss_dict["flow_loss"] = flow_loss.item()
+
+        # Smoothness regularization (Run 11)
+        smoothness_per_sample_loss = None
+        if needs_smoothness:
+            smoothness_per_sample_loss, smoothness_per_dim = self._compute_smoothness_loss(
+                aux["x_t"],
+                aux["v_t"],
+                aux["time_expanded"],
+                original_action_dim,
+            )
+            smoothness_loss = smoothness_per_sample_loss.mean()
+            loss_dict["smoothness_loss"] = smoothness_loss.item()
+            loss_dict["smoothness_per_dim"] = smoothness_per_dim.detach()
+        else:
+            smoothness_loss = None
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = flow_per_sample_loss
+            if smoothness_per_sample_loss is not None:
+                per_sample_loss = per_sample_loss + self.config.smoothness_lambda * smoothness_per_sample_loss
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = flow_loss
+            if smoothness_loss is not None:
+                loss = loss + self.config.smoothness_lambda * smoothness_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
