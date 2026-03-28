@@ -14,8 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_groot import GrootConfig
-from .modeling_groot import GrootPolicy
-from .processor_groot import make_groot_pre_post_processors
+# Python 3.12 で groot_n1.py の dataclass が
+# "non-default argument follows default argument" エラーを起こすため、
+# import をスキップする。GR00T 機能は本プロジェクトでは使用しない。
+# from .configuration_groot import GrootConfig
+# from .modeling_groot import GrootPolicy
+# from .processor_groot import make_groot_pre_post_processors
 
-__all__ = ["GrootConfig", "GrootPolicy", "make_groot_pre_post_processors"]
+# __all__ = ["GrootConfig", "GrootPolicy", "make_groot_pre_post_processors"]
