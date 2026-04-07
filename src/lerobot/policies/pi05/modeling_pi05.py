@@ -1147,7 +1147,10 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # DAFD adds new parameters (gripper_head) not in pretrained checkpoints.
+            # Use strict=False when DAFD is enabled to allow missing gripper_head keys.
+            effective_strict = strict and not config.use_dafd
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=effective_strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1454,8 +1457,13 @@ class PI05Policy(PreTrainedPolicy):
             loss_dict["gripper_accuracy"] = gripper_acc.item()
 
         # Action-dimension weighted loss (Run 10)
+        # When DAFD is enabled, gripper dim already has CE weight applied.
+        # Set gripper dim weight to 1.0 to avoid double-weighting.
         weights = self._get_action_dim_weights(original_action_dim, raw_losses.device, raw_losses.dtype)
         if weights is not None:
+            if self.config.use_dafd:
+                weights = weights.clone()
+                weights[self.config.dafd_gripper_dim] = 1.0
             losses = raw_losses * weights.view(1, 1, -1)
             loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
 

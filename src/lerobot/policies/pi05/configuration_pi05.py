@@ -100,8 +100,8 @@ class PI05Config(PreTrainedConfig):
     use_dafd: bool = True
     dafd_gripper_dim: int = 5                    # which action dim is gripper
     dafd_gripper_threshold: float = 0.0          # GT > threshold → close (1), else open (0)
-    dafd_gripper_open_value: float = -1.0        # value to inject at inference for "open"
-    dafd_gripper_close_value: float = 1.27       # value to inject at inference for "close"
+    dafd_gripper_open_value: float = -1.0        # NORMALIZED value for "open" (post-QUANTILES)
+    dafd_gripper_close_value: float = 1.0        # NORMALIZED value for "close" (post-QUANTILES)
     dafd_gripper_weight: float = 2.0             # CrossEntropy loss weight
     dafd_sign_dim: int = 10                      # which action dim gets sign loss (base_theta)
     dafd_sign_weight: float = 0.1                # sign consistency loss weight
