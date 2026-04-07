@@ -97,7 +97,7 @@ class PI05Config(PreTrainedConfig):
     # Decomposes action output into dimension-group-specific heads with
     # heterogeneous loss functions. Gripper uses CrossEntropy (classification)
     # instead of MSE (regression) to solve the bimodal averaging problem.
-    use_dafd: bool = False
+    use_dafd: bool = True
     dafd_gripper_dim: int = 5                    # which action dim is gripper
     dafd_gripper_threshold: float = 0.0          # GT > threshold → close (1), else open (0)
     dafd_gripper_open_value: float = -1.0        # value to inject at inference for "open"
