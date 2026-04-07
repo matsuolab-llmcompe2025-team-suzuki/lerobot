@@ -1080,33 +1080,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
-        # 破損フレームによる pyav/torchcodec のデコードエラーをスキップし、
-        # ランダムな別 index の item を返す。学習を止めないための安全策。
-        # 対象: av.error.InvalidDataError, RuntimeError (torchcodec), FrameTimestampError
-        import random
-
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                return self._getitem_inner(idx)
-            except Exception as e:
-                error_name = type(e).__name__
-                is_video_error = error_name in ("InvalidDataError", "FrameTimestampError") or (
-                    error_name == "RuntimeError" and "InvalidDataError" in str(e)
-                )
-                if is_video_error:
-                    import logging
-                    logging.warning(
-                        f"[LeRobot] 動画デコードエラーをスキップ (idx={idx}, attempt={attempt+1}/{max_retries}): "
-                        f"{error_name}: {e}"
-                    )
-                    idx = random.randint(0, len(self) - 1)
-                else:
-                    raise
-        # max_retries 超過: 最後の試行で例外を投げる
-        return self._getitem_inner(idx)
-
-    def _getitem_inner(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
         item = self.hf_dataset[idx]
