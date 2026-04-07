@@ -859,10 +859,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             losses[:, :, gripper_dim] = gripper_ce * self.config.dafd_gripper_weight
 
             # DAFD: sign consistency loss for base_theta
+            # Only penalize when GT velocity is non-zero (direction matters).
+            # When u_t ≈ 0 (robot stationary), direction is meaningless.
             sign_dim = self.config.dafd_sign_dim
             if self.config.dafd_sign_weight > 0 and sign_dim < u_t.shape[-1]:
-                sign_agreement = torch.sigmoid(torch.sign(u_t[:, :, sign_dim]) * v_t[:, :, sign_dim])
+                u_sign = u_t[:, :, sign_dim]
+                v_sign = v_t[:, :, sign_dim]
+                sign_agreement = torch.sigmoid(torch.sign(u_sign) * v_sign)
                 sign_loss = -torch.log(sign_agreement + 1e-8)
+                # Mask out samples where GT velocity is near zero
+                sign_mask = (u_sign.abs() > 1e-4).float()
+                sign_loss = sign_loss * sign_mask
                 losses[:, :, sign_dim] = losses[:, :, sign_dim] + self.config.dafd_sign_weight * sign_loss
 
         if return_aux:
