@@ -15,6 +15,7 @@
 # limitations under the License.
 import dataclasses
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -194,10 +195,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
+        # Read gradient accumulation from environment (set by accelerate launch)
+        grad_accum_steps = int(os.environ.get("ACCELERATE_GRADIENT_ACCUMULATION_STEPS", 1))
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
+            gradient_accumulation_steps=grad_accum_steps,
         )
 
     init_logging(accelerator=accelerator)

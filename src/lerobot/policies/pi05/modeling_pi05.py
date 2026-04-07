@@ -846,9 +846,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         if self.config.use_dafd:
             # DAFD: replace gripper dim loss with CrossEntropy classification
+            # Note: actions are NORMALIZED (QUANTILES maps to [-1, 1]).
+            # The threshold 0.0 splits the normalized bimodal distribution at its midpoint.
             gripper_dim = self.config.dafd_gripper_dim
             gripper_logits = self.gripper_head(suffix_out)  # (B, chunk, 2)
-            # Ground truth label: action > threshold → 1 (close), else 0 (open)
+            # Ground truth label: normalized action > threshold → 1 (close), else 0 (open)
             gripper_labels = (actions[:, :, gripper_dim] > self.config.dafd_gripper_threshold).long()
             gripper_ce = F.cross_entropy(
                 gripper_logits.reshape(-1, 2), gripper_labels.reshape(-1), reduction="none"
@@ -935,12 +937,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
 
+                # RTC needs a callable that returns v_t only (not DAFD tuple)
+                def rtc_denoise_call(input_x_t, current_timestep=time_tensor):
+                    result = self.denoise_step(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        x_t=input_x_t,
+                        timestep=current_timestep,
+                    )
+                    if isinstance(result, tuple):
+                        return result[0]
+                    return result
+
                 v_t = self.rtc_processor.denoise_step(
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
                     time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
+                    original_denoise_step_partial=rtc_denoise_call,
                     execution_horizon=execution_horizon,
                 )
             else:
@@ -1410,13 +1424,14 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
         needs_smoothness = self.config.smoothness_lambda > 0
+        needs_aux = needs_smoothness or self.config.use_dafd
 
         # Compute loss (no separate state needed for PI05)
         model_forward_output = self.model.forward(
             images, img_masks, tokens, masks, actions,
-            return_aux=needs_smoothness,
+            return_aux=needs_aux,
         )
-        if needs_smoothness:
+        if needs_aux:
             losses, aux = model_forward_output
         else:
             losses = model_forward_output
