@@ -46,6 +46,68 @@ from lerobot.utils.constants import (
 )
 
 
+@ProcessorStepRegistry.register(name="pi05_state_sanitizer_processor_step")
+@dataclass
+class Pi05StateSanitizerProcessorStep(ProcessorStep):
+    """Sanitize observation.state by replacing out-of-range values with previous frame values.
+
+    HSR physical joint limits define the valid range. Values outside (sensor errors,
+    data corruption) are replaced with the most recent valid value. On the very first
+    frame, out-of-range values are clamped to the nearest limit as a fallback.
+
+    This step MUST run BEFORE NormalizerProcessorStep so that normalization receives
+    clean values only.
+    """
+
+    # HSR physical joint limits (absolute positions, radians/meters)
+    state_ranges: dict = field(default_factory=lambda: {
+        0: (-0.05, 0.70),   # arm_lift
+        1: (-2.80, 0.10),   # arm_flex
+        2: (-2.10, 3.85),   # arm_roll
+        3: (-2.00, 1.30),   # wrist_flex
+        4: (-2.00, 3.70),   # wrist_roll
+        5: (-1.25, 1.45),   # gripper
+        6: (-1.80, 1.80),   # head_pan
+        7: (-1.70, 0.60),   # head_tilt
+    })
+
+    _prev_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+
+    def reset(self):
+        """Clear previous state on episode reset."""
+        self._prev_state = None
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
+        if state is None:
+            return transition
+
+        transition = transition.copy()
+        state = state.clone()
+
+        for dim, (lo, hi) in self.state_ranges.items():
+            if dim >= state.shape[-1]:
+                continue
+            bad = (state[..., dim] < lo) | (state[..., dim] > hi)
+            if not bad.any():
+                continue
+            if self._prev_state is not None:
+                # Replace with previous valid value
+                state[..., dim][bad] = self._prev_state[..., dim][bad]
+            else:
+                # First frame fallback: clamp to nearest limit
+                state[..., dim] = state[..., dim].clamp(lo, hi)
+
+        self._prev_state = state.clone().detach()
+        transition[TransitionKey.OBSERVATION][OBS_STATE] = state
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
 @dataclass
 class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
@@ -168,6 +230,9 @@ def make_pi05_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        # State sanitizer: replace sensor outliers with previous valid values.
+        # MUST run BEFORE normalizer so that normalization receives clean values only.
+        Pi05StateSanitizerProcessorStep(),
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
