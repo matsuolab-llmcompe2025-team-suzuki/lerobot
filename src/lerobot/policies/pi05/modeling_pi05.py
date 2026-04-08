@@ -583,6 +583,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # DAFD: gripper classification head (2-class: open/close)
+        if config.use_dafd:
+            self.gripper_head = nn.Linear(action_expert_config.width, 2)
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -840,8 +844,40 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
+        if self.config.use_dafd:
+            # DAFD: replace gripper dim loss with CrossEntropy classification
+            # Note: actions are NORMALIZED (QUANTILES maps to [-1, 1]).
+            # The threshold 0.0 splits the normalized bimodal distribution at its midpoint.
+            gripper_dim = self.config.dafd_gripper_dim
+            gripper_logits = self.gripper_head(suffix_out)  # (B, chunk, 2)
+            # Ground truth label: normalized action > threshold → 1 (close), else 0 (open)
+            gripper_labels = (actions[:, :, gripper_dim] > self.config.dafd_gripper_threshold).long()
+            gripper_ce = F.cross_entropy(
+                gripper_logits.reshape(-1, 2), gripper_labels.reshape(-1), reduction="none"
+            ).reshape(actions.shape[0], actions.shape[1])
+            # Replace gripper MSE with weighted CE in losses tensor
+            losses[:, :, gripper_dim] = gripper_ce * self.config.dafd_gripper_weight
+
+            # DAFD: sign consistency loss for base_theta
+            # Only penalize when GT velocity is non-zero (direction matters).
+            # When u_t ≈ 0 (robot stationary), direction is meaningless.
+            sign_dim = self.config.dafd_sign_dim
+            if self.config.dafd_sign_weight > 0 and sign_dim < u_t.shape[-1]:
+                u_sign = u_t[:, :, sign_dim]
+                v_sign = v_t[:, :, sign_dim]
+                sign_agreement = torch.sigmoid(torch.sign(u_sign) * v_sign)
+                sign_loss = -torch.log(sign_agreement + 1e-8)
+                # Mask out samples where GT velocity is near zero
+                sign_mask = (u_sign.abs() > 1e-4).float()
+                sign_loss = sign_loss * sign_mask
+                losses[:, :, sign_dim] = losses[:, :, sign_dim] + self.config.dafd_sign_weight * sign_loss
+
         if return_aux:
-            return losses, {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded}
+            aux = {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded}
+            if self.config.use_dafd:
+                aux["gripper_logits"] = gripper_logits.detach()
+                aux["gripper_labels"] = gripper_labels.detach()
+            return losses, aux
 
         return losses
 
@@ -888,6 +924,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         dt = -1.0 / num_steps
+        last_suffix_out = None  # for DAFD gripper classification
 
         x_t = noise
         for step in range(num_steps):
@@ -907,21 +944,49 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
 
+                # RTC needs a callable that returns v_t only (not DAFD tuple)
+                def rtc_denoise_call(input_x_t, current_timestep=time_tensor):
+                    result = self.denoise_step(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        x_t=input_x_t,
+                        timestep=current_timestep,
+                    )
+                    if isinstance(result, tuple):
+                        return result[0]
+                    return result
+
                 v_t = self.rtc_processor.denoise_step(
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
                     time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
+                    original_denoise_step_partial=rtc_denoise_call,
                     execution_horizon=execution_horizon,
                 )
             else:
-                v_t = denoise_step_partial_call(x_t)
+                result = denoise_step_partial_call(x_t)
+                if self.config.use_dafd and isinstance(result, tuple):
+                    v_t, last_suffix_out = result
+                else:
+                    v_t = result
 
             x_t = x_t + dt * v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        # DAFD: inject gripper classification result instead of integrated value
+        if self.config.use_dafd and last_suffix_out is not None:
+            gripper_dim = self.config.dafd_gripper_dim
+            gripper_logits = self.gripper_head(last_suffix_out)  # (B, chunk, 2)
+            gripper_pred = gripper_logits.argmax(dim=-1)  # (B, chunk) → 0=open, 1=close
+            gripper_values = torch.where(
+                gripper_pred == 1,
+                torch.tensor(self.config.dafd_gripper_close_value, device=device),
+                torch.tensor(self.config.dafd_gripper_open_value, device=device),
+            )
+            x_t[:, :, gripper_dim] = gripper_values
 
         return x_t
 
@@ -962,7 +1027,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        v_t = self.action_out_proj(suffix_out)
+
+        if self.config.use_dafd:
+            # Return both velocity and suffix_out for gripper classification
+            return v_t, suffix_out
+        return v_t
 
 
 class PI05Policy(PreTrainedPolicy):
@@ -1084,7 +1154,10 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # DAFD adds new parameters (gripper_head) not in pretrained checkpoints.
+            # Use strict=False when DAFD is enabled to allow missing gripper_head keys.
+            effective_strict = strict and not config.use_dafd
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=effective_strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1361,13 +1434,14 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
         needs_smoothness = self.config.smoothness_lambda > 0
+        needs_aux = needs_smoothness or self.config.use_dafd
 
         # Compute loss (no separate state needed for PI05)
         model_forward_output = self.model.forward(
             images, img_masks, tokens, masks, actions,
-            return_aux=needs_smoothness,
+            return_aux=needs_aux,
         )
-        if needs_smoothness:
+        if needs_aux:
             losses, aux = model_forward_output
         else:
             losses = model_forward_output
@@ -1383,9 +1457,20 @@ class PI05Policy(PreTrainedPolicy):
             "loss_per_dim": raw_losses.mean(dim=[0, 1]).detach(),
         }
 
+        # DAFD: log gripper classification accuracy
+        if self.config.use_dafd and aux is not None and "gripper_logits" in aux:
+            gripper_preds = aux["gripper_logits"].argmax(dim=-1)
+            gripper_acc = (gripper_preds == aux["gripper_labels"]).float().mean()
+            loss_dict["gripper_accuracy"] = gripper_acc.item()
+
         # Action-dimension weighted loss (Run 10)
+        # When DAFD is enabled, gripper dim already has CE weight applied.
+        # Set gripper dim weight to 1.0 to avoid double-weighting.
         weights = self._get_action_dim_weights(original_action_dim, raw_losses.device, raw_losses.dtype)
         if weights is not None:
+            if self.config.use_dafd:
+                weights = weights.clone()
+                weights[self.config.dafd_gripper_dim] = 1.0
             losses = raw_losses * weights.view(1, 1, -1)
             loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
 

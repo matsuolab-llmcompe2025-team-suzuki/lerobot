@@ -93,6 +93,19 @@ class PI05Config(PreTrainedConfig):
     smoothness_lambda: float = 0.0
     smoothness_exclude_dims: list[int] | None = None
 
+    # DAFD: Dimension-Aware Flow Decomposition
+    # Decomposes action output into dimension-group-specific heads with
+    # heterogeneous loss functions. Gripper uses CrossEntropy (classification)
+    # instead of MSE (regression) to solve the bimodal averaging problem.
+    use_dafd: bool = False  # enabled via config.json in DAFD-trained checkpoints
+    dafd_gripper_dim: int = 5                    # which action dim is gripper
+    dafd_gripper_threshold: float = 0.0          # GT > threshold → close (1), else open (0)
+    dafd_gripper_open_value: float = -1.0        # NORMALIZED value for "open" (post-QUANTILES)
+    dafd_gripper_close_value: float = 1.0        # NORMALIZED value for "close" (post-QUANTILES)
+    dafd_gripper_weight: float = 2.0             # CrossEntropy loss weight
+    dafd_sign_dim: int = 10                      # which action dim gets sign loss (base_theta)
+    dafd_sign_weight: float = 0.1                # sign consistency loss weight
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
