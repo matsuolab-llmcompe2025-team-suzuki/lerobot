@@ -59,15 +59,19 @@ class Pi05StateSanitizerProcessorStep(ProcessorStep):
     clean values only.
     """
 
-    # HSR physical joint limits (absolute positions, radians/meters)
+    # HSR joint limits for anomaly detection.
+    # Based on URDF (ToyotaResearchInstitute/hsr_description) + data distribution.
+    # gripper: URDF says [-0.798, 1.24] but real data has 17% of frames below -0.798
+    #          (normal operation). Use data p0.01/p99.99 instead, excluding 45+ corruption.
+    # head_pan: URDF says [-3.84, 1.75]. Previous value -1.80 was too strict.
     state_ranges: dict = field(default_factory=lambda: {
-        0: (-0.05, 0.70),   # arm_lift
-        1: (-2.80, 0.10),   # arm_flex
-        2: (-2.10, 3.85),   # arm_roll
-        3: (-2.00, 1.30),   # wrist_flex
-        4: (-2.00, 3.70),   # wrist_roll
-        5: (-1.25, 1.45),   # gripper
-        6: (-1.80, 1.80),   # head_pan
+        0: (-0.05, 0.70),   # arm_lift (URDF: 0.0~0.69 + margin)
+        1: (-2.80, 0.10),   # arm_flex (URDF: -2.62~0.0 + margin)
+        2: (-2.10, 3.85),   # arm_roll (URDF: -2.09~3.84 + margin)
+        3: (-2.00, 1.30),   # wrist_flex (URDF: -1.92~1.22 + margin)
+        4: (-2.00, 3.70),   # wrist_roll (URDF: -1.92~3.67 + margin)
+        5: (-1.10, 1.30),   # gripper (data: p0.1=-1.03, p99.9=1.27. URDF range too narrow)
+        6: (-4.00, 1.85),   # head_pan (URDF: -3.84~1.75 + margin)
         7: (-1.70, 0.60),   # head_tilt
     })
 
