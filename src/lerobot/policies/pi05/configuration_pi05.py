@@ -93,6 +93,12 @@ class PI05Config(PreTrainedConfig):
     smoothness_lambda: float = 0.0
     smoothness_exclude_dims: list[int] | None = None
 
+    # Issue #125 (Run 61): Action loss mask for sparse-layout action vectors
+    # When specified, listed dims are excluded from the flow matching loss
+    # (sum zeroed out and denominator adjusted). Default: None = no mask,
+    # backward compatible with existing training.
+    action_loss_exclude_dims: list[int] | None = None
+
     # DAFD: Dimension-Aware Flow Decomposition
     # Decomposes action output into dimension-group-specific heads with
     # heterogeneous loss functions. Gripper uses CrossEntropy (classification)
@@ -166,6 +172,13 @@ class PI05Config(PreTrainedConfig):
                 if dim < 0 or dim >= self.max_action_dim:
                     raise ValueError(
                         f"smoothness_exclude_dims contains invalid dim {dim}; expected in [0, {self.max_action_dim})"
+                    )
+
+        if self.action_loss_exclude_dims is not None:
+            for dim in self.action_loss_exclude_dims:
+                if dim < 0 or dim >= self.max_action_dim:
+                    raise ValueError(
+                        f"action_loss_exclude_dims contains invalid dim {dim}; expected in [0, {self.max_action_dim})"
                     )
 
     def validate_features(self) -> None:
