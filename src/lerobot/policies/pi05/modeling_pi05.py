@@ -1474,7 +1474,19 @@ class PI05Policy(PreTrainedPolicy):
             losses = raw_losses * weights.view(1, 1, -1)
             loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
 
-        flow_per_sample_loss = losses.mean(dim=(1, 2))
+        # Issue #125 (Run 61): Action loss mask for sparse-layout action vectors
+        # exclude_dims で指定された次元は loss 計算から除外し、分母も縮小する
+        loss_exclude_dims = self.config.action_loss_exclude_dims or []
+        if loss_exclude_dims:
+            include_mask = torch.ones(original_action_dim, device=losses.device, dtype=losses.dtype)
+            include_mask[loss_exclude_dims] = 0.0
+            included_dims = int(include_mask.sum().item())
+            if included_dims <= 0:
+                raise ValueError("action_loss_exclude_dims excludes all action dimensions")
+            masked_losses = losses * include_mask.view(1, 1, -1)
+            flow_per_sample_loss = masked_losses.sum(dim=(1, 2)) / (masked_losses.shape[1] * included_dims)
+        else:
+            flow_per_sample_loss = losses.mean(dim=(1, 2))
         flow_loss = flow_per_sample_loss.mean()
         loss_dict["flow_loss"] = flow_loss.item()
 
