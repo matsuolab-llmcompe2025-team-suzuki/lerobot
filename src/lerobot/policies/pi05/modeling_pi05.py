@@ -1453,9 +1453,11 @@ class PI05Policy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         raw_losses = losses
-        # GPU tensor のまま保持し、log step でのみ CPU 転送する（毎 step の GPU sync stall を回避）
+        # Per-dim loss を dim ごとに個別スカラーとして記録する。
+        # WandB wrapper が list/tensor を受け付けないため、loss_per_dim_00..31 に展開する。
+        per_dim = raw_losses.mean(dim=[0, 1]).detach()
         loss_dict = {
-            "loss_per_dim": raw_losses.mean(dim=[0, 1]).detach(),
+            f"loss_per_dim_{i:02d}": per_dim[i].item() for i in range(per_dim.shape[0])
         }
 
         # DAFD: log gripper classification accuracy
@@ -1473,7 +1475,9 @@ class PI05Policy(PreTrainedPolicy):
                 weights = weights.clone()
                 weights[self.config.dafd_gripper_dim] = 1.0
             losses = raw_losses * weights.view(1, 1, -1)
-            loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
+            per_dim_weighted = losses.mean(dim=[0, 1]).detach()
+            for i in range(per_dim_weighted.shape[0]):
+                loss_dict[f"loss_per_dim_weighted_{i:02d}"] = per_dim_weighted[i].item()
 
         # Issue #125 (Run 61): Action loss mask for sparse-layout action vectors
         # exclude_dims で指定された次元は loss 計算から除外し、分母も縮小する
@@ -1525,7 +1529,9 @@ class PI05Policy(PreTrainedPolicy):
             )
             smoothness_loss = smoothness_per_sample_loss.mean()
             loss_dict["smoothness_loss"] = smoothness_loss.item()
-            loss_dict["smoothness_per_dim"] = smoothness_per_dim.detach()
+            smoothness_per_dim_detached = smoothness_per_dim.detach()
+            for i in range(smoothness_per_dim_detached.shape[0]):
+                loss_dict[f"smoothness_per_dim_{i:02d}"] = smoothness_per_dim_detached[i].item()
         else:
             smoothness_loss = None
 
