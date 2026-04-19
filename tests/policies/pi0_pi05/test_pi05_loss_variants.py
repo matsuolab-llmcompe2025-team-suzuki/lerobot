@@ -103,7 +103,7 @@ def test_smooth_l1_vs_mse_differ_on_outliers():
     v[0, 0, 0] = 10.0  # 大きな外れ値
 
     mse = F.mse_loss(u, v, reduction="none").mean()
-    smooth_l1 = F.smooth_l1_loss(v, u, reduction="none", beta=1.0).mean()
+    smooth_l1 = F.smooth_l1_loss(u, v, reduction="none", beta=1.0).mean()
 
     # 外れ値 10 に対して MSE = 100, SmoothL1 = 10 - 0.5 = 9.5
     # 平均後: MSE ≈ 100/84 ≈ 1.19, SmoothL1 ≈ 9.5/84 ≈ 0.113

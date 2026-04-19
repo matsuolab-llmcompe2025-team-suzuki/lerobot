@@ -847,7 +847,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # than MSE — Kim, Finn et al. 2025 (arxiv 2502.19645).
         if self.config.flow_loss_type == "smooth_l1":
             losses = F.smooth_l1_loss(
-                v_t, u_t, reduction="none", beta=self.config.smooth_l1_beta
+                u_t, v_t, reduction="none", beta=self.config.smooth_l1_beta
             )
         else:
             losses = F.mse_loss(u_t, v_t, reduction="none")
