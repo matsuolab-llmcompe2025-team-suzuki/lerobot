@@ -842,7 +842,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-        losses = F.mse_loss(u_t, v_t, reduction="none")
+        # Issue #125 (Run 62): configurable distance metric for flow matching
+        # smooth_l1 (Huber) is more robust on outlier dims (e.g., gripper transitions)
+        # than MSE — Kim, Finn et al. 2025 (arxiv 2502.19645).
+        if self.config.flow_loss_type == "smooth_l1":
+            losses = F.smooth_l1_loss(
+                v_t, u_t, reduction="none", beta=self.config.smooth_l1_beta
+            )
+        else:
+            losses = F.mse_loss(u_t, v_t, reduction="none")
 
         if self.config.use_dafd:
             # DAFD: replace gripper dim loss with CrossEntropy classification
@@ -873,7 +881,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 losses[:, :, sign_dim] = losses[:, :, sign_dim] + self.config.dafd_sign_weight * sign_loss
 
         if return_aux:
-            aux = {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded}
+            aux = {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded, "time": time}
             if self.config.use_dafd:
                 aux["gripper_logits"] = gripper_logits.detach()
                 aux["gripper_labels"] = gripper_labels.detach()
@@ -1434,7 +1442,8 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
         needs_smoothness = self.config.smoothness_lambda > 0
-        needs_aux = needs_smoothness or self.config.use_dafd
+        needs_min_snr = self.config.use_min_snr_weighting
+        needs_aux = needs_smoothness or self.config.use_dafd or needs_min_snr
 
         # Compute loss (no separate state needed for PI05)
         model_forward_output = self.model.forward(
@@ -1487,6 +1496,22 @@ class PI05Policy(PreTrainedPolicy):
             flow_per_sample_loss = masked_losses.sum(dim=(1, 2)) / (masked_losses.shape[1] * included_dims)
         else:
             flow_per_sample_loss = losses.mean(dim=(1, 2))
+
+        # 重み付け前の生の flow_loss を先にログ記録（ハイパラ間の比較用）
+        loss_dict["flow_loss_raw"] = flow_per_sample_loss.mean().item()
+
+        # Issue #125 (Run 62): Min-SNR-γ timestep weighting for flow matching
+        # w(t) = min(SNR(t), γ) / (SNR(t) + 1), SNR(t) = ((1-t)/t)^2
+        # Hang et al. 2023 (arxiv 2303.09556) v-prediction variant applied to FM.
+        if self.config.use_min_snr_weighting:
+            time = aux["time"]  # (B,)
+            eps = 1e-6
+            t_clamped = time.clamp(min=eps, max=1.0 - eps)
+            snr = ((1.0 - t_clamped) / t_clamped) ** 2
+            min_snr_weight = torch.clamp(snr, max=self.config.min_snr_gamma) / (snr + 1.0)
+            flow_per_sample_loss = flow_per_sample_loss * min_snr_weight.to(flow_per_sample_loss.dtype)
+            loss_dict["min_snr_weight_mean"] = min_snr_weight.mean().item()
+
         flow_loss = flow_per_sample_loss.mean()
         loss_dict["flow_loss"] = flow_loss.item()
 
