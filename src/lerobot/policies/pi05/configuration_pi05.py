@@ -99,14 +99,6 @@ class PI05Config(PreTrainedConfig):
     # backward compatible with existing training.
     action_loss_exclude_dims: list[int] | None = None
 
-    # Issue #125 (Run 62): Flow matching distance metric
-    # "mse" = F.mse_loss (default, backward compatible with previous runs)
-    # "smooth_l1" = F.smooth_l1_loss (Huber, robust to outlier dims like gripper)
-    # Reference: Kim, Finn et al. 2025 (arxiv 2502.19645) — L1 beat classification
-    # heads on OpenVLA LIBERO fine-tuning.
-    flow_loss_type: str = "mse"
-    smooth_l1_beta: float = 1.0
-
     # Issue #125 (Run 62): Min-SNR-γ timestep weighting for flow matching
     # Reweights the per-sample flow loss by min(SNR(t), γ) / (SNR(t) + 1)
     # where SNR(t) = ((1-t)/t)^2 for linear FM schedule.
@@ -197,14 +189,6 @@ class PI05Config(PreTrainedConfig):
                     raise ValueError(
                         f"action_loss_exclude_dims contains invalid dim {dim}; expected in [0, {self.max_action_dim})"
                     )
-
-        if self.flow_loss_type not in ("mse", "smooth_l1"):
-            raise ValueError(
-                f"flow_loss_type must be 'mse' or 'smooth_l1', got {self.flow_loss_type!r}"
-            )
-
-        if self.smooth_l1_beta <= 0:
-            raise ValueError("smooth_l1_beta must be > 0")
 
         if self.min_snr_gamma <= 0:
             raise ValueError("min_snr_gamma must be > 0")

@@ -842,15 +842,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-        # Issue #125 (Run 62): configurable distance metric for flow matching
-        # smooth_l1 (Huber) is more robust on outlier dims (e.g., gripper transitions)
-        # than MSE — Kim, Finn et al. 2025 (arxiv 2502.19645).
-        if self.config.flow_loss_type == "smooth_l1":
-            losses = F.smooth_l1_loss(
-                u_t, v_t, reduction="none", beta=self.config.smooth_l1_beta
-            )
-        else:
-            losses = F.mse_loss(u_t, v_t, reduction="none")
+        losses = F.mse_loss(u_t, v_t, reduction="none")
 
         if self.config.use_dafd:
             # DAFD: replace gripper dim loss with CrossEntropy classification
@@ -1503,12 +1495,19 @@ class PI05Policy(PreTrainedPolicy):
         # Issue #125 (Run 62): Min-SNR-γ timestep weighting for flow matching
         # w(t) = min(SNR(t), γ) / (SNR(t) + 1), SNR(t) = ((1-t)/t)^2
         # Hang et al. 2023 (arxiv 2303.09556) v-prediction variant applied to FM.
+        # 注意: v-prediction → FM velocity (u_t = ε - x_0) は heuristic transfer。
+        # コミュニティ慣用 (diffusionflow.github.io) に従う。
         if self.config.use_min_snr_weighting:
             time = aux["time"]  # (B,)
             eps = 1e-6
             t_clamped = time.clamp(min=eps, max=1.0 - eps)
             snr = ((1.0 - t_clamped) / t_clamped) ** 2
             min_snr_weight = torch.clamp(snr, max=self.config.min_snr_gamma) / (snr + 1.0)
+            # Terminal-SNR guard: 原論文 (guided_diffusion/gaussian_diffusion.py:895) に倣い
+            # SNR=0 (t=1) では weight=1 にフォールバック。eps clamp で通常は発火しない防衛策。
+            min_snr_weight = torch.where(
+                snr == 0, torch.ones_like(min_snr_weight), min_snr_weight
+            )
             flow_per_sample_loss = flow_per_sample_loss * min_snr_weight.to(flow_per_sample_loss.dtype)
             loss_dict["min_snr_weight_mean"] = min_snr_weight.mean().item()
 

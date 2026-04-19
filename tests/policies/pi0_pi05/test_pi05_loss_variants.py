@@ -7,7 +7,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Smoke tests for PI05 loss variants: flow_loss_type and use_min_snr_weighting.
+"""Smoke tests for PI05 flow matching loss variants: use_min_snr_weighting.
 
 CPU-only. Covers config validation and Min-SNR weight numerical correctness.
 Issue #125 (Run 62).
@@ -15,7 +15,6 @@ Issue #125 (Run 62).
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 pytest.importorskip("transformers")
 
@@ -27,28 +26,16 @@ def _make_config(**overrides) -> PI05Config:
 
 
 def test_default_config_backward_compatible():
-    """既存の学習に影響が無いことを確認 (flow_loss_type='mse', min_snr 無効)"""
+    """既存の学習に影響が無いことを確認 (min_snr 無効)"""
     config = _make_config()
-    assert config.flow_loss_type == "mse"
-    assert config.smooth_l1_beta == 1.0
     assert config.use_min_snr_weighting is False
     assert config.min_snr_gamma == 5.0
 
 
-def test_smooth_l1_config_accepted():
-    config = _make_config(flow_loss_type="smooth_l1", smooth_l1_beta=0.5)
-    assert config.flow_loss_type == "smooth_l1"
-    assert config.smooth_l1_beta == 0.5
-
-
-def test_invalid_flow_loss_type_rejected():
-    with pytest.raises(ValueError, match="flow_loss_type must be"):
-        _make_config(flow_loss_type="huber")
-
-
-def test_invalid_smooth_l1_beta_rejected():
-    with pytest.raises(ValueError, match="smooth_l1_beta must be > 0"):
-        _make_config(smooth_l1_beta=-1.0)
+def test_min_snr_config_accepted():
+    config = _make_config(use_min_snr_weighting=True, min_snr_gamma=3.0)
+    assert config.use_min_snr_weighting is True
+    assert config.min_snr_gamma == 3.0
 
 
 def test_invalid_min_snr_gamma_rejected():
@@ -85,6 +72,8 @@ def test_min_snr_weight_tensor():
     t_c = time.clamp(min=eps, max=1.0 - eps)
     snr = ((1.0 - t_c) / t_c) ** 2
     weights = torch.clamp(snr, max=gamma) / (snr + 1.0)
+    # Terminal-SNR guard
+    weights = torch.where(snr == 0, torch.ones_like(weights), weights)
 
     expected = []
     for t in time.tolist():
@@ -96,17 +85,14 @@ def test_min_snr_weight_tensor():
     assert (weights <= gamma / (gamma + 1.0) + 1e-5).all()  # 上限: γ/(γ+1)
 
 
-def test_smooth_l1_vs_mse_differ_on_outliers():
-    """SmoothL1 が外れ値に対して MSE より小さい勾配になることを確認"""
-    u = torch.zeros(4, 3, 7)
-    v = torch.zeros(4, 3, 7)
-    v[0, 0, 0] = 10.0  # 大きな外れ値
+def test_min_snr_terminal_guard():
+    """SNR=0 のとき weight=1 にフォールバックすることを確認"""
+    snr = torch.tensor([0.0, 1.0, 5.0, 100.0])
+    gamma = 5.0
+    weights = torch.clamp(snr, max=gamma) / (snr + 1.0)
+    weights = torch.where(snr == 0, torch.ones_like(weights), weights)
 
-    mse = F.mse_loss(u, v, reduction="none").mean()
-    smooth_l1 = F.smooth_l1_loss(u, v, reduction="none", beta=1.0).mean()
-
-    # 外れ値 10 に対して MSE = 100, SmoothL1 = 10 - 0.5 = 9.5
-    # 平均後: MSE ≈ 100/84 ≈ 1.19, SmoothL1 ≈ 9.5/84 ≈ 0.113
-    assert smooth_l1 < mse
-    assert abs(mse.item() - 100.0 / (4 * 3 * 7)) < 1e-4
-    assert abs(smooth_l1.item() - 9.5 / (4 * 3 * 7)) < 1e-4
+    assert weights[0].item() == 1.0  # guard kicks in
+    assert abs(weights[1].item() - 0.5) < 1e-6
+    assert abs(weights[2].item() - 5.0 / 6.0) < 1e-6
+    assert abs(weights[3].item() - 5.0 / 101.0) < 1e-6
