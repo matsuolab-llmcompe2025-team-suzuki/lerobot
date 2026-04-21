@@ -873,7 +873,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 losses[:, :, sign_dim] = losses[:, :, sign_dim] + self.config.dafd_sign_weight * sign_loss
 
         if return_aux:
-            aux = {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded}
+            aux = {"x_t": x_t, "v_t": v_t, "time_expanded": time_expanded, "time": time}
             if self.config.use_dafd:
                 aux["gripper_logits"] = gripper_logits.detach()
                 aux["gripper_labels"] = gripper_labels.detach()
@@ -1434,7 +1434,8 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
         needs_smoothness = self.config.smoothness_lambda > 0
-        needs_aux = needs_smoothness or self.config.use_dafd
+        needs_min_snr = self.config.use_min_snr_weighting
+        needs_aux = needs_smoothness or self.config.use_dafd or needs_min_snr
 
         # Compute loss (no separate state needed for PI05)
         model_forward_output = self.model.forward(
@@ -1452,9 +1453,11 @@ class PI05Policy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         raw_losses = losses
-        # GPU tensor のまま保持し、log step でのみ CPU 転送する（毎 step の GPU sync stall を回避）
+        # Per-dim loss を dim ごとに個別スカラーとして記録する。
+        # WandB wrapper が list/tensor を受け付けないため、loss_per_dim_00..31 に展開する。
+        per_dim = raw_losses.mean(dim=[0, 1]).detach()
         loss_dict = {
-            "loss_per_dim": raw_losses.mean(dim=[0, 1]).detach(),
+            f"loss_per_dim_{i:02d}": per_dim[i].item() for i in range(per_dim.shape[0])
         }
 
         # DAFD: log gripper classification accuracy
@@ -1472,7 +1475,9 @@ class PI05Policy(PreTrainedPolicy):
                 weights = weights.clone()
                 weights[self.config.dafd_gripper_dim] = 1.0
             losses = raw_losses * weights.view(1, 1, -1)
-            loss_dict["loss_per_dim_weighted"] = losses.mean(dim=[0, 1]).detach()
+            per_dim_weighted = losses.mean(dim=[0, 1]).detach()
+            for i in range(per_dim_weighted.shape[0]):
+                loss_dict[f"loss_per_dim_weighted_{i:02d}"] = per_dim_weighted[i].item()
 
         # Issue #125 (Run 61): Action loss mask for sparse-layout action vectors
         # exclude_dims で指定された次元は loss 計算から除外し、分母も縮小する
@@ -1487,6 +1492,29 @@ class PI05Policy(PreTrainedPolicy):
             flow_per_sample_loss = masked_losses.sum(dim=(1, 2)) / (masked_losses.shape[1] * included_dims)
         else:
             flow_per_sample_loss = losses.mean(dim=(1, 2))
+
+        # 重み付け前の生の flow_loss を先にログ記録（ハイパラ間の比較用）
+        loss_dict["flow_loss_raw"] = flow_per_sample_loss.mean().item()
+
+        # Issue #125 (Run 62): Min-SNR-γ timestep weighting for flow matching
+        # w(t) = min(SNR(t), γ) / (SNR(t) + 1), SNR(t) = ((1-t)/t)^2
+        # Hang et al. 2023 (arxiv 2303.09556) v-prediction variant applied to FM.
+        # 注意: v-prediction → FM velocity (u_t = ε - x_0) は heuristic transfer。
+        # コミュニティ慣用 (diffusionflow.github.io) に従う。
+        if self.config.use_min_snr_weighting:
+            time = aux["time"]  # (B,)
+            eps = 1e-6
+            t_clamped = time.clamp(min=eps, max=1.0 - eps)
+            snr = ((1.0 - t_clamped) / t_clamped) ** 2
+            min_snr_weight = torch.clamp(snr, max=self.config.min_snr_gamma) / (snr + 1.0)
+            # Terminal-SNR guard: 原論文 (guided_diffusion/gaussian_diffusion.py:895) に倣い
+            # SNR=0 (t=1) では weight=1 にフォールバック。eps clamp で通常は発火しない防衛策。
+            min_snr_weight = torch.where(
+                snr == 0, torch.ones_like(min_snr_weight), min_snr_weight
+            )
+            flow_per_sample_loss = flow_per_sample_loss * min_snr_weight.to(flow_per_sample_loss.dtype)
+            loss_dict["min_snr_weight_mean"] = min_snr_weight.mean().item()
+
         flow_loss = flow_per_sample_loss.mean()
         loss_dict["flow_loss"] = flow_loss.item()
 
@@ -1501,7 +1529,9 @@ class PI05Policy(PreTrainedPolicy):
             )
             smoothness_loss = smoothness_per_sample_loss.mean()
             loss_dict["smoothness_loss"] = smoothness_loss.item()
-            loss_dict["smoothness_per_dim"] = smoothness_per_dim.detach()
+            smoothness_per_dim_detached = smoothness_per_dim.detach()
+            for i in range(smoothness_per_dim_detached.shape[0]):
+                loss_dict[f"smoothness_per_dim_{i:02d}"] = smoothness_per_dim_detached[i].item()
         else:
             smoothness_loss = None
 

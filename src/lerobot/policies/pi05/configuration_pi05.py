@@ -99,6 +99,15 @@ class PI05Config(PreTrainedConfig):
     # backward compatible with existing training.
     action_loss_exclude_dims: list[int] | None = None
 
+    # Issue #125 (Run 62): Min-SNR-γ timestep weighting for flow matching
+    # Reweights the per-sample flow loss by min(SNR(t), γ) / (SNR(t) + 1)
+    # where SNR(t) = ((1-t)/t)^2 for linear FM schedule.
+    # Based on Hang et al. 2023 (arxiv 2303.09556) v-prediction variant,
+    # adapted to FM via the diffusion↔FM weighting equivalence.
+    # Default γ=5.0 from original paper.
+    use_min_snr_weighting: bool = False
+    min_snr_gamma: float = 5.0
+
     # DAFD: Dimension-Aware Flow Decomposition
     # Decomposes action output into dimension-group-specific heads with
     # heterogeneous loss functions. Gripper uses CrossEntropy (classification)
@@ -180,6 +189,9 @@ class PI05Config(PreTrainedConfig):
                     raise ValueError(
                         f"action_loss_exclude_dims contains invalid dim {dim}; expected in [0, {self.max_action_dim})"
                     )
+
+        if self.min_snr_gamma <= 0:
+            raise ValueError("min_snr_gamma must be > 0")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
