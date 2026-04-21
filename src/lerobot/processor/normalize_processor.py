@@ -93,6 +93,11 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
+    # If set, clamp normalized tensors to [-normalization_clip, +normalization_clip]
+    # after forward normalization. Prevents rare outlier frames (e.g. head motion
+    # spikes in airoa-sft-v5) from producing target values far beyond the model's
+    # output range, which would otherwise dominate the per-dim loss.
+    normalization_clip: float | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -237,6 +242,8 @@ class _NormalizationMixin:
         }
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
+        if self.normalization_clip is not None:
+            config["normalization_clip"] = self.normalization_clip
         return config
 
     def _normalize_observation(self, observation: RobotObservation, inverse: bool) -> dict[str, Tensor]:
@@ -322,6 +329,7 @@ class _NormalizationMixin:
 
         stats = self._tensor_stats[key]
 
+        result: Tensor
         if norm_mode == NormalizationMode.MEAN_STD:
             mean = stats.get("mean", None)
             std = stats.get("std", None)
@@ -335,9 +343,9 @@ class _NormalizationMixin:
             denom = std + self.eps
             if inverse:
                 return tensor * std + mean
-            return (tensor - mean) / denom
+            result = (tensor - mean) / denom
 
-        if norm_mode == NormalizationMode.MIN_MAX:
+        elif norm_mode == NormalizationMode.MIN_MAX:
             min_val = stats.get("min", None)
             max_val = stats.get("max", None)
             if min_val is None or max_val is None:
@@ -357,9 +365,9 @@ class _NormalizationMixin:
                 # Map from [-1, 1] back to [min, max]
                 return (tensor + 1) / 2 * denom + min_val
             # Map from [min, max] to [-1, 1]
-            return 2 * (tensor - min_val) / denom - 1
+            result = 2 * (tensor - min_val) / denom - 1
 
-        if norm_mode == NormalizationMode.QUANTILES:
+        elif norm_mode == NormalizationMode.QUANTILES:
             q01 = stats.get("q01", None)
             q99 = stats.get("q99", None)
             if q01 is None or q99 is None:
@@ -374,9 +382,9 @@ class _NormalizationMixin:
             )
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q01
-            return 2.0 * (tensor - q01) / denom - 1.0
+            result = 2.0 * (tensor - q01) / denom - 1.0
 
-        if norm_mode == NormalizationMode.QUANTILE10:
+        elif norm_mode == NormalizationMode.QUANTILE10:
             q10 = stats.get("q10", None)
             q90 = stats.get("q90", None)
             if q10 is None or q90 is None:
@@ -391,10 +399,17 @@ class _NormalizationMixin:
             )
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q10
-            return 2.0 * (tensor - q10) / denom - 1.0
+            result = 2.0 * (tensor - q10) / denom - 1.0
 
-        # If necessary stats are missing, return input unchanged.
-        return tensor
+        else:
+            # If necessary stats are missing, return input unchanged.
+            return tensor
+
+        # Forward-only: clamp normalized values to prevent rare outlier frames
+        # from producing targets far outside the model's output range.
+        if self.normalization_clip is not None:
+            result = result.clamp(-self.normalization_clip, self.normalization_clip)
+        return result
 
 
 @dataclass

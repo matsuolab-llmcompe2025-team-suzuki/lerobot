@@ -121,6 +121,14 @@ class PI05Config(PreTrainedConfig):
     dafd_sign_dim: int = 10                      # which action dim gets sign loss (base_theta)
     dafd_sign_weight: float = 0.1                # sign consistency loss weight
 
+    # Run 65: Normalization clip (symmetric clamp on normalized values)
+    # Clamps normalized action/state tensors to [-normalization_clip, +normalization_clip]
+    # during forward normalization. Prevents outlier frames (e.g. head_tilt spikes in
+    # airoa-sft-v5 where q99-q01 is tiny but raw max is large) from generating
+    # targets far outside the model's output range, which would otherwise dominate
+    # per-dim loss and starve non-outlier dimensions of gradient.
+    normalization_clip: float | None = None
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -175,6 +183,11 @@ class PI05Config(PreTrainedConfig):
 
         if self.smoothness_lambda < 0:
             raise ValueError("smoothness_lambda must be >= 0")
+
+        if self.normalization_clip is not None and self.normalization_clip <= 0:
+            raise ValueError(
+                f"normalization_clip must be > 0 when provided, got {self.normalization_clip}"
+            )
 
         if self.smoothness_exclude_dims is not None:
             for dim in self.smoothness_exclude_dims:
