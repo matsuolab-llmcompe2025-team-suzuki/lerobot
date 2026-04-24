@@ -1223,6 +1223,16 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
+            # Previously this silently returned a base-init (random) model, which
+            # caused weeks of invalid evaluation before the issue was noticed.
+            # When strict loading was requested, surface the error instead.
+            if strict:
+                raise RuntimeError(
+                    f"PI05Policy.from_pretrained failed to load state dict "
+                    f"(strict={strict}). This would silently return a "
+                    f"randomly-initialized model. Pass strict=False explicitly "
+                    f"if this is intentional. Original error: {e}"
+                ) from e
             print(f"Warning: Could not load state dict: {e}")
 
         return model
@@ -1276,6 +1286,13 @@ class PI05Policy(PreTrainedPolicy):
             if "patch_embedding" in key:
                 # Some checkpoints might have this, but current model expects different structure
                 logging.warning(f"Vision embedding key might need handling: {key}")
+
+            # Older checkpoints (e.g. Run52-era, lerobot/pi05_base, pi05-baseline-100k-pt)
+            # store SigLIP vision tower keys with an extra `vision_model.` nesting inherited
+            # from transformers SiglipVisionModel. Current PI05Policy expects `vision_tower.*`
+            # (flat). Strip the prefix so old ckpts load without silent fallback.
+            if "vision_tower.vision_model." in new_key:
+                new_key = new_key.replace("vision_tower.vision_model.", "vision_tower.")
 
             if (
                 key == "model.paligemma_with_expert.paligemma.lm_head.weight"

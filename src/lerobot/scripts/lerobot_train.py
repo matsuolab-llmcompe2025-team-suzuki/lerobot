@@ -71,6 +71,7 @@ def update_policy(
     dpo_config: DPOConfig | None = None,
     ref_policy: PreTrainedPolicy | None = None,
     batch_rejected: Any | None = None,
+    ema_model=None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -106,8 +107,11 @@ def update_policy(
     if rabc_weights_provider is not None:
         rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
 
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
+    # accelerator.accumulate(policy) enables gradient accumulation when the env var
+    # ACCELERATE_GRADIENT_ACCUMULATION_STEPS > 1 (or when launched with
+    # `accelerate launch --gradient_accumulation_steps N`). Without this context
+    # manager, Accelerate performs no accumulation even if the env var is set.
+    with accelerator.accumulate(policy), accelerator.autocast():
         if dpo_config is not None and ref_policy is not None and batch_rejected is not None:
             # DPO-FM: preferred/rejected ペアから DPO loss を計算
             # DDP ラップを外して内部メソッドにアクセスできるようにする
@@ -133,26 +137,37 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    # Use accelerator's backward method
-    accelerator.backward(loss)
+        # Use accelerator's backward method (scales loss by accumulation factor
+        # when inside accumulate())
+        accelerator.backward(loss)
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+        # Clip gradients and step the optimizer only on the sync step. When
+        # accumulating, accelerator.sync_gradients is False on the intermediate
+        # steps, so clip/step/scheduler/EMA are gated.
+        if accelerator.sync_gradients:
+            if grad_clip_norm > 0:
+                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), float("inf"), error_if_nonfinite=False
+                )
 
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+            # Optimizer step
+            with lock if lock is not None else nullcontext():
+                optimizer.step()
 
-    optimizer.zero_grad()
+            optimizer.zero_grad()
 
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+            # Step through pytorch scheduler at every batch instead of epoch
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+
+            # Update EMA weights (exponential moving average) once per optimizer.step.
+            if ema_model is not None:
+                ema_model.update_parameters(accelerator.unwrap_model(policy))
+        else:
+            # Accumulating — preserve previous grad_norm for logging. Use 0.0 as sentinel.
+            grad_norm = torch.tensor(0.0, device=loss.device)
 
     # Update internal buffers if policy has update method
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
@@ -505,6 +520,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         dataloader_rej = accelerator.prepare(dataloader_rej)
         dl_iter_rej = cycle(dataloader_rej)
 
+    # Build EMA shadow model if requested (pi0.5 official recipe uses
+    # ema_decay=0.999). EMA is updated once per optimizer.step (sync step) and
+    # its weights are written to pretrained_model/ at checkpoint time.
+    ema_model = None
+    ema_decay = getattr(cfg.policy, "ema_decay", 0.999)
+    use_ema = getattr(cfg.policy, "use_ema", False)
+    if use_ema:
+        from torch.optim.swa_utils import AveragedModel
+
+        def _ema_avg_fn(averaged_model_parameter, model_parameter, num_averaged):
+            return ema_decay * averaged_model_parameter + (1.0 - ema_decay) * model_parameter
+
+        ema_model = AveragedModel(
+            accelerator.unwrap_model(policy),
+            device=accelerator.device,
+            avg_fn=_ema_avg_fn,
+            use_buffers=True,
+        )
+        if is_main_process:
+            logging.info(f"EMA enabled: decay={ema_decay}")
+
     policy.train()
 
     train_metrics = {
@@ -564,6 +600,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             dpo_config=dpo_config,
             ref_policy=ref_policy,
             batch_rejected=batch_rej,
+            ema_model=ema_model,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -604,16 +641,42 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    step=step,
-                    cfg=cfg,
-                    policy=accelerator.unwrap_model(policy),
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                )
+
+                # When EMA is enabled, write the EMA weights to pretrained_model/
+                # (that is what gets pushed to HF Hub and used for inference).
+                # Swap EMA weights in, save, then swap back to keep training on raw.
+                if ema_model is not None:
+                    unwrapped_policy = accelerator.unwrap_model(policy)
+                    raw_state = {
+                        k: v.detach().clone() for k, v in unwrapped_policy.state_dict().items()
+                    }
+                    ema_state = ema_model.module.state_dict()
+                    # Only copy parameters that exist in both (AveragedModel may add
+                    # extra buffers like `n_averaged` which the policy doesn't have).
+                    to_load = {k: v for k, v in ema_state.items() if k in raw_state}
+                    unwrapped_policy.load_state_dict(to_load, strict=False)
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=unwrapped_policy,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
+                    unwrapped_policy.load_state_dict(raw_state, strict=False)
+                else:
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
@@ -680,10 +743,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if cfg.policy.push_to_hub:
             unwrapped_policy = accelerator.unwrap_model(policy)
-            if cfg.policy.use_peft:
-                unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
+            # When EMA is enabled, push the EMA weights (not the raw training
+            # weights) so HF Hub snapshots mirror what the checkpoints contain.
+            if ema_model is not None:
+                raw_state = {
+                    k: v.detach().clone() for k, v in unwrapped_policy.state_dict().items()
+                }
+                ema_state = ema_model.module.state_dict()
+                to_load = {k: v for k, v in ema_state.items() if k in raw_state}
+                unwrapped_policy.load_state_dict(to_load, strict=False)
+                try:
+                    if cfg.policy.use_peft:
+                        unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
+                    else:
+                        unwrapped_policy.push_model_to_hub(cfg)
+                finally:
+                    unwrapped_policy.load_state_dict(raw_state, strict=False)
             else:
-                unwrapped_policy.push_model_to_hub(cfg)
+                if cfg.policy.use_peft:
+                    unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
+                else:
+                    unwrapped_policy.push_model_to_hub(cfg)
             preprocessor.push_to_hub(cfg.policy.repo_id)
             postprocessor.push_to_hub(cfg.policy.repo_id)
 

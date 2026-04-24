@@ -156,6 +156,13 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # EMA settings (openpi: ema_decay=0.999 for pi05_libero, 0.99 for droid/aloha).
+    # When enabled, a shadow copy of the policy weights is tracked via exponential
+    # moving average; EMA weights are written to pretrained_model/ at checkpoint time
+    # and pushed to HF Hub, while the raw weights continue training.
+    use_ema: bool = False
+    ema_decay: float = 0.999
+
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     def __post_init__(self):
