@@ -587,6 +587,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if config.use_dafd:
             self.gripper_head = nn.Linear(action_expert_config.width, 2)
 
+        # Issue #150 (Run 66): Auxiliary base velocity head
+        # Predicts mean of `aux_base_velocity_dims` action-chunk values from the
+        # mean-pooled image prefix. Gradients flow back through the vision tower,
+        # forcing the encoder to encode base-motion cues in its image features.
+        if config.use_aux_base_velocity_head:
+            self.base_vel_head = nn.Linear(
+                paligemma_config.width,
+                len(config.aux_base_velocity_dims),
+            )
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -702,11 +712,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def embed_prefix(
         self, images, img_masks, tokens, masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Embed images with SigLIP and language tokens with embedding layer.
+
+        Returns:
+            embs: concatenated image + language embeddings
+            pad_masks: padding masks aligned with `embs`
+            att_masks: attention masks aligned with `embs`
+            num_image_tokens: total number of image token positions at the head
+                of `embs` (before language tokens). Useful for downstream heads
+                that want to pool over image-only tokens (e.g. base_vel_head).
+        """
         embs = []
         pad_masks = []
         att_masks = []
+        num_image_tokens = 0
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -716,6 +736,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
             bsize, num_img_embs = img_emb.shape[:2]
+            num_image_tokens += num_img_embs
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
@@ -741,7 +762,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, num_image_tokens
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -802,8 +823,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, num_img_tokens = self.embed_prefix(
+            images, img_masks, tokens, masks
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+
+        # Issue #150 (Run 66): Auxiliary base-velocity prediction from pooled
+        # image prefix tokens. Computed before the bf16 cast below so the
+        # Linear head operates in fp32.
+        base_vel_pred = None
+        if self.config.use_aux_base_velocity_head:
+            vision_pool = prefix_embs[:, :num_img_tokens, :].mean(dim=1)
+            base_vel_pred = self.base_vel_head(vision_pool.to(dtype=torch.float32))
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -877,6 +908,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if self.config.use_dafd:
                 aux["gripper_logits"] = gripper_logits.detach()
                 aux["gripper_labels"] = gripper_labels.detach()
+            if base_vel_pred is not None:
+                aux["base_vel_pred"] = base_vel_pred
             return losses, aux
 
         return losses
@@ -908,7 +941,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
+            images, img_masks, tokens, masks
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -1154,9 +1189,14 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            # DAFD adds new parameters (gripper_head) not in pretrained checkpoints.
-            # Use strict=False when DAFD is enabled to allow missing gripper_head keys.
-            effective_strict = strict and not config.use_dafd
+            # DAFD (gripper_head) and A-aux (base_vel_head) add new parameters not
+            # present in pretrained checkpoints. Use strict=False when either is
+            # enabled to allow the extra keys to be initialized from scratch.
+            effective_strict = (
+                strict
+                and not config.use_dafd
+                and not config.use_aux_base_velocity_head
+            )
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=effective_strict)
 
             if missing_keys:
@@ -1435,7 +1475,8 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         needs_smoothness = self.config.smoothness_lambda > 0
         needs_min_snr = self.config.use_min_snr_weighting
-        needs_aux = needs_smoothness or self.config.use_dafd or needs_min_snr
+        needs_aux_base_vel = self.config.use_aux_base_velocity_head
+        needs_aux = needs_smoothness or self.config.use_dafd or needs_min_snr or needs_aux_base_vel
 
         # Compute loss (no separate state needed for PI05)
         model_forward_output = self.model.forward(
@@ -1535,11 +1576,32 @@ class PI05Policy(PreTrainedPolicy):
         else:
             smoothness_loss = None
 
+        # Issue #150 (Run 66): Auxiliary base-velocity regression loss.
+        # Predict mean of `aux_base_velocity_dims` action-chunk values from the
+        # pooled image prefix; push gradients through the vision encoder so it
+        # encodes base-motion cues without letting past actions into the input
+        # (which would cause causal confusion, cf. de Haan 2019 / NADA 2025).
+        aux_base_velocity_per_sample = None
+        aux_base_velocity_loss = None
+        if needs_aux_base_vel and aux is not None and "base_vel_pred" in aux:
+            aux_dims = self.config.aux_base_velocity_dims
+            base_vel_gt = actions[:, :, aux_dims].mean(dim=1).to(dtype=torch.float32)
+            aux_base_velocity_per_sample = F.mse_loss(
+                aux["base_vel_pred"], base_vel_gt, reduction="none"
+            ).mean(dim=-1)
+            aux_base_velocity_loss = aux_base_velocity_per_sample.mean()
+            loss_dict["aux_base_velocity_loss"] = aux_base_velocity_loss.item()
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = flow_per_sample_loss
             if smoothness_per_sample_loss is not None:
                 per_sample_loss = per_sample_loss + self.config.smoothness_lambda * smoothness_per_sample_loss
+            if aux_base_velocity_per_sample is not None:
+                per_sample_loss = (
+                    per_sample_loss
+                    + self.config.aux_base_velocity_weight * aux_base_velocity_per_sample
+                )
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -1547,6 +1609,8 @@ class PI05Policy(PreTrainedPolicy):
             loss = flow_loss
             if smoothness_loss is not None:
                 loss = loss + self.config.smoothness_lambda * smoothness_loss
+            if aux_base_velocity_loss is not None:
+                loss = loss + self.config.aux_base_velocity_weight * aux_base_velocity_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
