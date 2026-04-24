@@ -129,6 +129,19 @@ class PI05Config(PreTrainedConfig):
     # per-dim loss and starve non-outlier dimensions of gradient.
     normalization_clip: float | None = None
 
+    # Issue #150 (Run 66): Auxiliary base velocity prediction head
+    # Adds a Linear head on top of the mean-pooled image prefix embeddings to
+    # predict the mean of `aux_base_velocity_dims` action-chunk values (default
+    # base x/y/theta deltas). The resulting MSE is added to the flow-matching
+    # loss with weight `aux_base_velocity_weight`. The head injects base-motion
+    # signal into the vision encoder without modifying the input distribution,
+    # avoiding the causal-confusion shortcut that arises when past actions are
+    # fed through observation.state (de Haan et al. 2019; Liu et al. 2025 NADA).
+    # Rationale: Past-Token Prediction (arXiv:2505.09561), Villa-X (arXiv:2509.18428).
+    use_aux_base_velocity_head: bool = False
+    aux_base_velocity_weight: float = 0.1
+    aux_base_velocity_dims: list[int] = field(default_factory=lambda: [13, 14, 15])
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -205,6 +218,22 @@ class PI05Config(PreTrainedConfig):
 
         if self.min_snr_gamma <= 0:
             raise ValueError("min_snr_gamma must be > 0")
+
+        if self.use_aux_base_velocity_head:
+            if self.aux_base_velocity_weight < 0:
+                raise ValueError(
+                    f"aux_base_velocity_weight must be >= 0, got {self.aux_base_velocity_weight}"
+                )
+            if not self.aux_base_velocity_dims:
+                raise ValueError(
+                    "aux_base_velocity_dims must be non-empty when use_aux_base_velocity_head=True"
+                )
+            for dim in self.aux_base_velocity_dims:
+                if dim < 0 or dim >= self.max_action_dim:
+                    raise ValueError(
+                        f"aux_base_velocity_dims contains invalid dim {dim}; "
+                        f"expected in [0, {self.max_action_dim})"
+                    )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
