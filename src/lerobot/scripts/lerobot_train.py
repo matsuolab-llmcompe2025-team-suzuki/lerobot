@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import json
 import logging
 import os
 import time
@@ -598,6 +599,25 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         }
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
+
+            # WandB rewind protection で history が破棄されるケース (resume 後 step が
+            # server の current_step を下回る場面) のバックアップとして JSONL に追記する。
+            # wandb_logger 無効時も per-dim metrics を確実に保存できる。
+            if is_main_process:
+                try:
+                    metrics_path = os.path.join(str(cfg.output_dir), "metrics.jsonl")
+                    record = {"step": step}
+                    if wandb_logger:
+                        record.update(wandb_log_dict)
+                    else:
+                        record.update(train_tracker.to_dict())
+                        if output_dict:
+                            record.update(output_dict)
+                    with open(metrics_path, "a") as f:
+                        f.write(json.dumps(record, default=float) + "\n")
+                except Exception as e:
+                    logging.warning(f"Failed to write metrics.jsonl: {e}")
+
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
