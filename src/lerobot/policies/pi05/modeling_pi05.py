@@ -1619,7 +1619,16 @@ class PI05Policy(PreTrainedPolicy):
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
-        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        alternatives = [
+            rf".*\.gemma_expert\..*\.self_attn\.(q|v)_proj",
+            rf"model\.({common_projections})",
+        ]
+        if getattr(self.config, "lora_include_vision_tower", False):
+            # SigLIP attention layers live under
+            # vision_tower.vision_model.encoder.layers.<N>.self_attn.<q|k|v|out>_proj
+            # The pooling head's `attention` (MultiheadAttention) is intentionally skipped.
+            alternatives.append(rf".*\.vision_tower\..*\.self_attn\.(q|k|v|out)_proj")
+        target_modules = rf"({'|'.join(alternatives)})"
         return {
             "target_modules": target_modules,
             "modules_to_save": [],
