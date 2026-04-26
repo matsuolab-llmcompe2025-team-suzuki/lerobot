@@ -1303,7 +1303,43 @@ class PI05Policy(PreTrainedPolicy):
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
-        return self.parameters()
+        multiplier = self.config.vision_lr_multiplier
+        if (
+            not self.config.lora_include_vision_tower
+            or multiplier is None
+            or multiplier == 1.0
+        ):
+            return self.parameters()
+
+        base_lr = self.config.optimizer_lr
+        vision_params: list[nn.Parameter] = []
+        other_params: list[nn.Parameter] = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "vision_tower" in name:
+                vision_params.append(param)
+            else:
+                other_params.append(param)
+
+        param_groups: list[dict[str, any]] = []
+        if vision_params:
+            param_groups.append(
+                {
+                    "params": vision_params,
+                    "lr": base_lr * multiplier,
+                    "name": "vision_tower",
+                }
+            )
+        if other_params:
+            param_groups.append(
+                {
+                    "params": other_params,
+                    "lr": base_lr,
+                    "name": "other",
+                }
+            )
+        return param_groups
 
     def reset(self):
         """Reset internal state - called when environment resets."""
