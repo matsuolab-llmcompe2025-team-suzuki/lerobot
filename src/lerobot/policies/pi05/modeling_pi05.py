@@ -348,12 +348,18 @@ class PaliGemmaWithExpertModel(
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
+        vision_tower_trainable: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        # When train_expert_only=True we still let the vision_tower stay in
+        # train mode so that LoRA adapters injected into its self-attention
+        # projections receive dropout / proper gradients. PEFT freezes every
+        # non-adapter parameter again after wrapping, so requires_grad is safe.
+        self.vision_tower_trainable = vision_tower_trainable
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -428,6 +434,10 @@ class PaliGemmaWithExpertModel(
             self.paligemma.eval()
             for param in self.paligemma.parameters():
                 param.requires_grad = False
+            if self.vision_tower_trainable and not self.freeze_vision_encoder:
+                # Restore train mode on vision_tower so LoRA adapters get the
+                # right behavior; PEFT will freeze base params again later.
+                self.paligemma.model.vision_tower.train()
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -435,6 +445,8 @@ class PaliGemmaWithExpertModel(
             self.paligemma.model.vision_tower.eval()
         if self.train_expert_only:
             self.paligemma.eval()
+            if mode and self.vision_tower_trainable and not self.freeze_vision_encoder:
+                self.paligemma.model.vision_tower.train()
 
     def embed_image(self, image: torch.Tensor):
         # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
@@ -575,6 +587,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
+            vision_tower_trainable=config.lora_include_vision_tower,
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
@@ -1307,7 +1320,43 @@ class PI05Policy(PreTrainedPolicy):
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
-        return self.parameters()
+        multiplier = self.config.vision_lr_multiplier
+        if (
+            not self.config.lora_include_vision_tower
+            or multiplier is None
+            or multiplier == 1.0
+        ):
+            return self.parameters()
+
+        base_lr = self.config.optimizer_lr
+        vision_params: list[nn.Parameter] = []
+        other_params: list[nn.Parameter] = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "vision_tower" in name:
+                vision_params.append(param)
+            else:
+                other_params.append(param)
+
+        param_groups: list[dict[str, any]] = []
+        if vision_params:
+            param_groups.append(
+                {
+                    "params": vision_params,
+                    "lr": base_lr * multiplier,
+                    "name": "vision_tower",
+                }
+            )
+        if other_params:
+            param_groups.append(
+                {
+                    "params": other_params,
+                    "lr": base_lr,
+                    "name": "other",
+                }
+            )
+        return param_groups
 
     def reset(self):
         """Reset internal state - called when environment resets."""
@@ -1636,7 +1685,16 @@ class PI05Policy(PreTrainedPolicy):
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
-        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        alternatives = [
+            rf".*\.gemma_expert\..*\.self_attn\.(q|v)_proj",
+            rf"model\.({common_projections})",
+        ]
+        if getattr(self.config, "lora_include_vision_tower", False):
+            # SigLIP attention layers live under
+            # vision_tower.vision_model.encoder.layers.<N>.self_attn.<q|k|v|out>_proj
+            # The pooling head's `attention` (MultiheadAttention) is intentionally skipped.
+            alternatives.append(rf".*\.vision_tower\..*\.self_attn\.(q|k|v|out)_proj")
+        target_modules = rf"({'|'.join(alternatives)})"
         return {
             "target_modules": target_modules,
             "modules_to_save": [],

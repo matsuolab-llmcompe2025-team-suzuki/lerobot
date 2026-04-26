@@ -142,6 +142,20 @@ class PI05Config(PreTrainedConfig):
     aux_base_velocity_weight: float = 0.1
     aux_base_velocity_dims: list[int] = field(default_factory=lambda: [13, 14, 15])
 
+    # Issue #167 (Run 70): Extend default LoRA target_modules to include the
+    # SigLIP vision encoder's self-attention projections
+    # (vision_tower.vision_model.encoder.layers.*.self_attn.{q,k,v,out}_proj).
+    # When False (default), the LoRA targets stay limited to the action expert
+    # and projection heads — preserving the behavior of every prior run.
+    lora_include_vision_tower: bool = False
+
+    # Issue #167 (Run 70): Optional learning-rate multiplier applied only to
+    # vision_tower parameters (and their LoRA adapters) when
+    # `lora_include_vision_tower=True`. Used to keep the vision encoder's LR
+    # below the action expert's (e.g. 0.1 for vision_lr = 1e-6 with base LR
+    # 1e-5). `None` keeps a single param group (default, backward compatible).
+    vision_lr_multiplier: float | None = None
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
